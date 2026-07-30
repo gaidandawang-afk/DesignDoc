@@ -5,7 +5,7 @@
 目标场景：DP-attention、ATTN_TP=1、moe_a2a_backend=deepep（MC2）、enable_dp_lm_head、纯 EP=DP
 核心目标：**单个 DP rank 故障时，靠 MC2 的 mask 容错 + 固定通信组（不换 comm）继续推理，CUDA/NPU graph 不因容错而重捕；控制面走可重建的独立 gloo PG。**
 
-> 本文区分：**原理闭环**（机制已验证可行）/ **工程待办**（方向明确但未实现）/ **待钉死**（最后一两个事实确认中）。
+> 本文区分：**原理闭环**（机制已验证可行）/ **工程待办**（方向明确但未实现）。原"待钉死"项（D7、C1）已全部验证闭环，见 §5。
 
 ---
 
@@ -84,10 +84,10 @@ C1（`MLPSyncBatchInfo.all_gather`，`scheduler_components/dp_attn.py:158`）是
 对照 vLLM `gpu_worker_sentinel.py:120`（`get_dp_group().cpu_group = stateless_init_...`）：
 
 1. **建独立 FT gloo PG**：distributed 初始化时新建一个 gloo PG（含全部 DP rank），与 `_TP` 解耦，注册进 ParallelState。
-2. **C1 换组**：`prepare_mlp_sync_batch_raw` 的 group 从 `_TP.cpu_group` 换成 FT gloo PG（只换 group，不改语义）。改动点（subagent 已定位）：
-   - `dp_attn.py:277-292` group/device 选择插新分支；
-   - `dp_attn.py:169-178` active_ranks 来源从 `get_tp_group()` 换成 FT PG；
-   - `dp_attn.py:140-141` slot 形状（dp×tp×cp）按 FT PG 重算。
+2. **C1 换组**：`prepare_mlp_sync_batch_raw` 的 group 从 `_TP.cpu_group` 换成 FT gloo PG（只换 group，不改语义，输出逐字节一致）。改动点（subagent 已定位）：
+   - `dp_attn.py:290-292`（else 分支）把 `tp_group.cpu_group` 换成 FT gloo PG；
+   - `dp_attn.py:168-178` active_ranks 来源从 `get_tp_group()` 换成 FT PG（注意：`all_gather` 读 `active_ranks_cpu` 做 fallback 掩码，FT PG 的 ranks 必须与 `tp_group` 完全一致，只换 PG 对象不换成员）。
+   - **前提确认**：运行配置须落在 else 分支（`disable_overlap_schedule` 或 `SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH=True` 时走 HCCL device_group，不在此分支）。
 3. **stateless 重建 + 紧凑重编号**：故障时销毁旧 gloo PG、用新 port + recompact rank（0..N-1，不能带洞）重建。SGLang 无 stateless group 实现，需照抄 vLLM `stateless_init_torch_distributed_process_group` + `original_to_new` + `update_parallel_config`。
 4. **图外安全**：C1 在 NPU graph 外，重建 gloo PG **不触发重捕**。
 
@@ -96,15 +96,19 @@ C1 不走 gloo 集合，改走 FT 的 ZMQ 控制通道（watchdog 上报 + Token
 
 ---
 
-## 5. 待钉死项
+## 5. 验证结论（原"待钉死项"，已闭环）
 
-### 5.1 D7 是否冗余可跳过（验证中）
-- **假设**：MC2/deepep combine 已沿 EP 组内化跨 rank 求和（对照 vllm `output_is_reduced()==True`），D7 的 `_TP` all_reduce 冗余。
-- **若是冗余**：给 SGLang 加 `output_is_reduced()` 判断——combine 后端为已内化规约的（MC2/deepep/mooncake）时跳过 D7。落点：`fused_moe_triton/layer.py:1396` 与 `deepseek_v2.py:1009` 两处。
-- **vllm 证据**：`fused_moe.py:414-421` 注释"In mc2commimpl and alltoallcommimpl, we do not need to all-reduce the final outputs since the outputs are already aggregated"。
+### 5.1 D7 在 NPU+MC2+纯 EP 下根本不发生（已确认）
+- **结论**：D7 不是"冗余要跳过"，而是**结构性不存在**。deepep 路径走 `forward_deepep`（`deepseek_v2.py:1196-1422`），该分支**没有任何 post-experts all_reduce**；`deepseek_v2.py:1009/1131` 的 all_reduce 只在非-deepep 的 `forward_normal*` 分支，deepep 进不去。
+- 且 `reduce_results=False`（`fused_moe_triton/layer.py:212` 默认值，DeepseekV2MoE 构造未覆盖，`deepseek_v2.py:626`），`layer.py:1396` 的 `if self.reduce_results and (...)` 短路。
+- combine 已沿 EP 组内化完整规约（`deepep.py:632/830`，dispatcher `combine()` 无附加 AR），与 vllm `output_is_reduced()==True` 语义一致。
+- **无需新增 gate，D7 自动闭环。**
 
-### 5.2 C1 在 NPU+MC2 的具体落点（验证中）
-NPU 的 `cpu_group` backend、C1 是否每 step 必发、换组后 graph 形状决策一致性、NPU 是否已有 stateless 重建机制。
+### 5.2 C1 换独立 gloo PG 可行性（已确认）
+- **可行性高、语义零变化**：C1 是纯图外 CPU 集合（`tp_group.cpu_group`=gloo），产物只喂 NPU graph 的 bucket/padding 形状决策，换同 ranks 的独立 gloo PG 输出逐字节一致。
+- **NPU 无专属控制面分支**，C1 完全复用通用 `prepare_mlp_sync_batch_raw`；默认 overlap 调度走 else 分支（`dp_attn.py:290-292` → `tp_group.cpu_group`）。
+- **NPU 无现成 stateless 重建脚手架**：`elastic_ep` 是 mooncake/nixl-only（`elastic_ep.py:105` 门控），NPU+deepep(MC2) 不在其范围，需自建 PG 重建/健康检查逻辑。
+- **风险点**：① 换组必须确认实际运行配置落在 else 分支（`disable_overlap_schedule` 或 `SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH=True` 时走 HCCL device_group）；② 重建 gloo PG 时 ranks 必须与 `tp_group` 完全一致（`all_gather` 读 `get_tp_group().active_ranks_cpu` 做 fallback 掩码，`dp_attn.py:168-169`），只换 PG 对象不换成员。
 
 ---
 
@@ -116,7 +120,7 @@ NPU 的 `cpu_group` backend、C1 是否每 step 必发、换组后 graph 形状�
 | **dispatch/combine 定位** | 本方案：D2/D3 内化进 MC2 dispatch/combine | 收编进可插拔 `all2all_manager.dispatch/combine` |
 | **D2/D3 数据面** | MC2 独立 EP 组 + active_ranks mask | DeepEP/NixlEP 独立资源 + mask |
 | **D2/D3 是否入图** | 入图（MC2 op 一部分），但组固定不换 → 不重捕 | 入图，资源独立不换 → 不重捕 |
-| **post-experts 规约（D7）** | 当前无条件 `_TP` all_reduce（**冗余**） | `output_is_reduced()` 判断，内化规约的后端跳过 |
+| **post-experts 规约（D7）** | **不发生**（deepep 走 `forward_deepep`，`reduce_results=False`） | `output_is_reduced()` 判断，内化规约的后端跳过 |
 | **logits（D4/D5）** | 开 `enable_dp_lm_head` 消除 | sequence-parallel/finalize TP=1 跳过（隐式等价） |
 | **控制面（C1）** | 独立容错 gloo PG + stateless 重建（**待实现**） | stateless gloo cpu_group，`get_dp_group().cpu_group=新pg` |
 | **stateless 机制** | **无，需照抄 vLLM 新写** | `stateless_init_torch_distributed_process_group` + `original_to_new` 重编号 |
@@ -128,8 +132,8 @@ NPU 的 `cpu_group` backend、C1 是否每 step 必发、换组后 graph 形状�
 - **mooncake dispatcher 已带 active_ranks**（`mooncake.py:234,274`），数据面 mask 容错已具备。
 
 ### 6.2 SGLang 落后需补的
-- **D7 无 `output_is_reduced()` 判断**（冗余 all_reduce）。
-- **无 stateless group / 紧凑重编号**（控制面重建机制缺失）。
+- **无 stateless group / 紧凑重编号**（控制面重建机制缺失；NPU 的 `elastic_ep` 是 mooncake/nixl-only，不可复用）。
+- （D7 已确认不发生，无需补 `output_is_reduced()`。）
 
 ---
 
@@ -138,10 +142,9 @@ NPU 的 `cpu_group` backend、C1 是否每 step 必发、换组后 graph 形状�
 | # | 改动 | 落点 | 量 |
 |---|---|---|---|
 | 1 | 开 `enable_dp_lm_head` | server_args | 配置 |
-| 2 | D7 加 `output_is_reduced()` 跳过 | fused_moe_triton/layer.py:1396、deepseek_v2.py:1009 | ~2 处 gate |
-| 3 | 建独立容错 gloo PG + getter | parallel_state / distributed 初始化 | 新增 1 组 |
-| 4 | C1 换组到 FT gloo PG | dp_attn.py:277-292、:169-178、:140-141 | 3 处 |
-| 5 | stateless 重建 + 紧凑重编号 | 照抄 vLLM stateless 机制 | 新增机制 |
-| 6 | （可选）D7 换 reduce_scatterv / 内化 | moe/utils.py | 视 5.1 结论 |
+| 2 | 建独立容错 gloo PG + getter | parallel_state / distributed 初始化 | 新增 1 组 |
+| 3 | C1 换组到 FT gloo PG | dp_attn.py:290-292（else 分支）、:168-178（active_ranks 来源） | 2 处 |
+| 4 | stateless 重建 + 紧凑重编号（NPU 自建，不可复用 mooncake/nixl 的 elastic_ep） | 照抄 vLLM stateless 机制 | 新增机制 |
+| 5 | （确认项）运行配置落在 else 分支；重建时 ranks 与 tp_group 一致 | dp_attn.py:284-292、:168-169 | 验证 |
 
-**结论**：原理上无残留障碍。数据面（D1~D7）已闭环（消除/内化/配置），唯一工程残留是 D7 的冗余 all_reduce gate；控制面（C1）需新建独立容错 gloo PG + stateless 重建机制。两者合起来，SGLang 在 NPU + MC2 下可实现"拓扑变更不重捕图"的 DP 粒度容错。
+**结论**：原理上无残留障碍。数据面（D1~D7）已全部闭环——D1 不发生、D2/D3 内化进 MC2、D4/D5 开 `enable_dp_lm_head` 消除、D6 本地、D7 不发生（deepep 路径）。**数据面零工程改动**（仅需开 `enable_dp_lm_head` 配置）。唯一工程待办在**控制面 C1**：新建独立容错 gloo PG + stateless 重建/紧凑重编号机制（NPU 需自建，不可复用 mooncake/nixl 的 elastic_ep）。两者合起来，SGLang 在 NPU + MC2 下可实现"拓扑变更不重捕图"的 DP 粒度容错。
