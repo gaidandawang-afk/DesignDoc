@@ -275,3 +275,111 @@ retract 重算（适配点 2）与 503/重推（适配点 7）是设备无关机
 - NPU 上的 `continue` 策略（幸存者不暂停继续服务）；
 - pause/resume 进行中的二次故障（继承 FT 指南边界）；
 - 已流式输出 token 的故障 DP 请求续推（会产生重复输出）。
+
+---
+
+## 6. 故障处理全流程与 NPU 插入点（图示）
+
+标记约定：**蓝色实线框 = 两种设备共用的控制面主干（一套代码，不改动）；黄色虚线框 = NPU 插入点（GPU 上为 no-op）**。标记 ★0~★8 与 6.4 节映射表对应。
+
+### 6.1 总流程与 NPU 插入链
+
+```mermaid
+flowchart TD
+    classDef base fill:#eef3fb,stroke:#4a78c2,color:#1a1a1a
+    classDef npu fill:#fff4d6,stroke:#d99a06,color:#1a1a1a,stroke-dasharray:5 4
+
+    subgraph SPINE [共用控制面主干 — GPU/NPU 一套代码]
+        F([故障发生<br/>进程退出 · Python exception · 设备 hang]):::base
+        DET[检测与隔离<br/>watchdog DOWN / lease 超时 / 异常上报<br/>关闭故障 DP 路由 · admission 503]:::base
+        PAUSE[pause 幸存 DP<br/>MLP sync 边界生效 · ACK · 启动 deadline]:::base
+        DEC{上层 apply<br/>retry / scale_down}:::base
+        RESUME[resume 命令<br/>投递各幸存 DP leader]:::base
+        RUN[恢复推理<br/>_engine_paused=False]:::base
+        F --> DET --> PAUSE --> DEC --> RESUME --> RUN
+    end
+
+    subgraph NPULANE [NPU 插入链 — GPU 上全部 no-op, 主干直通]
+        N0[★0 设备 hang → forward 检查点<br/>转受控异常, 走既有 exception 族]:::npu
+        N1[★1 pause ACK 后<br/>各幸存 rank stop_device]:::npu
+        N2[★2 resume 阶段1<br/>restart_device]:::npu
+        N3[★3 resume 阶段2<br/>reinit_process_group<br/>集体 = 天然 barrier]:::npu
+        N4[★4 resume 阶段2<br/>独立容错 gloo PG 可用<br/>C1 通道]:::npu
+        N5[★5 resume 阶段3<br/>retract batch 回 waiting queue<br/>释放 KV · 保留 output_ids]:::npu
+        N6[★6 resume 阶段4 前<br/>图有效性检查<br/>必要时重捕]:::npu
+        N0 --> DET
+        N1 --> N2 --> N3 --> N4 --> N5 --> N6
+    end
+
+    F -.- N0
+    PAUSE -. ACK 后 .-> N1
+    RESUME -. GPU: 直通 RUN<br/>NPU: 四阶段事务 .-> N2
+    N6 -. 四阶段完成 → ACK .-> RUN
+```
+
+### 6.2 in-flight 请求分支（对应适配点 2 / 7）
+
+```mermaid
+flowchart TD
+    classDef gpu fill:#eef3fb,stroke:#4a78c2,color:#1a1a1a
+    classDef npu fill:#fff4d6,stroke:#d99a06,color:#1a1a1a,stroke-dasharray:5 4
+
+    R([故障时刻的 in-flight 请求])
+    R --> H{请求所在 DP}
+    H -->|健康 DP| HG[GPU: keep 原地保留<br/>resume 后继续生成]:::gpu
+    H -->|健康 DP| HN[★5 NPU: retract 回队重算<br/>重 prefill 续推<br/>客户端仅停顿, 无重复 token]:::npu
+    H -->|故障 DP（进程已死）| FD{已发出 token?}
+    FD -->|否| RP[★8 重推: 原 GenerateReqInput<br/>发往健康 DP<br/>复用 rid · 存活检查 · 重试上限<br/>客户端拿到完整 response]:::npu
+    FD -->|是（已流式输出）| K5[★8 503 终态<br/>重推会产生重复输出, 禁止]:::npu
+```
+
+### 6.3 时序细节
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant FLT as 故障源
+    participant CP as Node0控制面(TM+FTMgr)
+    participant SCH as 幸存 schedulers
+    participant DEV as 设备hook(FtDeviceOps)
+    participant API as 上层/客户端
+
+    FLT->>CP: watchdog DOWN / lease 超时 / 受控异常上报
+    Note over FLT,CP: ★0 NPU 设备 hang 在 forward 检查点转为受控异常（GPU 无此步）
+    CP->>CP: process_active[dp]=false · 关闭路由 · admission 503
+    CP->>SCH: pause（全部 runtime-active DP）
+    SCH->>SCH: MLP sync 边界: 当前 forward 完成 → _engine_paused
+    SCH-->>CP: pause ACK · 各 Scheduler 启动 deadline
+    rect rgb(255, 244, 214)
+    Note over SCH,DEV: ★1 pause 完成后（GPU: 跳过）
+    SCH->>DEV: on_pause_complete() → stop_device(本 rank)
+    end
+    API->>CP: apply: retry / scale_down
+    CP->>SCH: resume
+    rect rgb(255, 244, 214)
+    Note over SCH,DEV: ★2~★6 resume 四阶段事务（GPU: 全部跳过, batch 原地保留）
+    SCH->>DEV: ★2 restart_device
+    SCH->>SCH: ★3 reinit_process_group（集体=天然 barrier）
+    Note over SCH: ★4 此后 MLP sync 走独立容错 gloo PG（C1 已重建）
+    SCH->>SCH: ★5 retract running_batch → waiting queue（保留 output_ids）
+    Note over SCH: ★6 图有效性检查, 必要时重捕
+    end
+    SCH-->>CP: resume ACK（四阶段完成）
+    CP-->>API: admission 开放, 恢复服务
+    SCH->>SCH: next batch: 被 retract 请求重 prefill 续推
+    Note over CP,API: 并行路径 — ★7 rejoin replacement 进程 device init 前 stop+restart，<br/>★8 故障 DP 请求: 未出 token → 重推, 已出 token → 503
+```
+
+### 6.4 标记与适配点映射
+
+| 标记 | 插入时机 | GPU 行为 | NPU 动作 | 对应适配点 |
+| --- | --- | --- | --- | --- |
+| ★0 | 故障发生（设备 hang 呈现） | 无此故障呈现 | forward 检查点转受控异常，注入 exception 族 | 6 |
+| ★1 | pause ACK 之后 | noop | 各幸存 rank `stop_device` | 1 |
+| ★2 | resume 事务·阶段 1 | noop | `restart_device` | 1 |
+| ★3 | resume 事务·阶段 2 | noop | `reinit_process_group`（集体即 barrier） | 4 |
+| ★4 | resume 事务·阶段 2 | mooncake-cpu 现成可用 | 独立容错 gloo PG（C1）重建并接管 MLP sync | 4 |
+| ★5 | resume 事务·阶段 3 | keep：running_batch 原地保留 | retract 回 waiting queue，重 prefill 续推 | 2 |
+| ★6 | resume 事务·阶段 4 前 | 跳过 | 图有效性检查，必要时重捕 | 5 |
+| ★7 | rejoin 进程 device init | 正常 init | `stop_device` + `restart_device` 连做 | 1 |
+| ★8 | process-DOWN 之后 | 原生：挂起（可选启用） | 未出 token → 重推；已出 token → 503 | 7 |
