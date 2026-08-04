@@ -1,9 +1,9 @@
 # SGLang DP-only FT 架构设计与验证指南
 
 生成时间：2026-07-17  
-最后更新：2026-07-27  
+最后更新：2026-07-31  
 用途：给人工审查者和后续 Codex agent 提供最新、可独立阅读的架构与测试上下文。  
-基准：SGLang `worktree-dp-only-ft-revise@<PENDING_FT_COMMIT>`；本轮实现基于 `81d859af67c5581cf6f360775e4034ae72a687ff`。
+基准：SGLang `worktree-dp-only-ft-revise@aa88dae21f74eb1ed5d9fbfe9b0c779e5d8c57b2`；本轮实现基于 `81d859af67c5581cf6f360775e4034ae72a687ff`。
 
 > 本文区分三种结论：
 >
@@ -21,12 +21,12 @@
 
 1. scheduler 进程退出时由本节点 watchdog 立即上报所属 DP 不可用；整个远端 DPC/watchdog 一起消失时，由 Node 0 的 heartbeat lease 在无推理条件下判定其本地 DP 不可用。
 2. Node 0 汇总进程状态、Mooncake membership 和上层主动隔离状态，得到唯一的最终 DP 路由。
-3. `pause` 策略先暂停仍可用的 DP，等待上层选择 `retry` 或 `scale_down`。
+3. `pause` 策略先暂停仍可用的 DP，等待上层选择 `retry` 或 `scale_down`；若成功 pause 后超过配置时限仍无人处置，每个节点独立触发本节点 fail-stop，避免服务无限期停留在不可恢复的 paused 状态。
 4. `continue` 策略直接移除故障 DP，其他 DP 继续服务。
 5. `scale_down` 永远以 DP 为单位，只做逻辑隔离，不杀进程、不释放 GPU、不扩大故障半径。
 6. `recover` 是上层撤销逻辑隔离的唯一入口；runtime rejoin 不能隐式修改控制面授权。
 7. 多节点 rejoin 仍复用 Mooncake 原生恢复，不新增 supervisor、PID 代理或独立 runtime 恢复协议。
-8. 单个 scheduler 故障不能连带清理同节点其他 DP，也不能连带 kill 同一 DP 中仍存活的其他 attention/EP rank；但 `A*C>1` 时若死亡者是 DP leader，存活 sibling 会卡在以 leader 为源的 work broadcast，当前不能在线恢复。
+8. 单个 scheduler 故障不能连带清理同节点其他 DP，也不能连带 kill 同一 DP 中仍存活的其他 attention/EP rank；但 `A*C>1` 时若死亡者是 DP leader，存活 sibling 会卡在以 leader 为源的 work broadcast，当前不能在线恢复。成功 pause 后长期无人处置触发的是独立的服务级安全兜底，此时允许每个节点清理自己的完整进程树。
 
 ### 1.2 四个基础事实
 
@@ -44,12 +44,12 @@
 - `scale_down` 不负责 kill scheduler，不释放 GPU。
 - 不支持 `scale_down.shutdown` 参数。
 - 不引入 `DPSupervisor`、`PIDProcess`、远程 PID 代理或跨节点 shutdown RPC。
-- 不把一个 scheduler 退出扩展成“清理全部本地 scheduler”。
+- 不把一个 scheduler 退出扩展成“清理全部本地 scheduler”；成功 pause 后无人处置超时属于独立的服务级 fail-stop，不改变普通 child-exit 的隔离语义。
 - 不新增独立探针端口或 heartbeat 线程；节点存活检测复用 DPC watchdog 线程和现有 Tokenizer ZMQ endpoint。
 - 不扩展 no-DP-attention 的跨节点 FT 通道。
 - 不处理 `A*C>1` 时 DP leader 死亡、sibling 残存的在线恢复。
 - 不处理 Node 0 / Tokenizer 所在控制面整机故障。
-- 不处理 pause/resume 进行中的二次局部故障和陈旧 generation。
+- 不恢复 pause/resume 进行中或 DP 已 paused 后发生的二次局部故障和陈旧 generation；尤其不支持 paused DP 的 leader 随后死亡但 sibling 残存。成功 pause 后无人处置会被 deadline 最终终止，但这不是在线恢复。
 - 不支持 FT 的 `dp_size=1`。
 - 不把 exception 故障和进程退出故障混成一个测试流程。
 
@@ -67,14 +67,15 @@
 
 - Workspace：`D:\Codex\repos\sglang-dp-only-ft-revise`
 - Branch：`worktree-dp-only-ft-revise`
-- HEAD：`<PENDING_FT_COMMIT>`
+- HEAD：`aa88dae21f74eb1ed5d9fbfe9b0c779e5d8c57b2`
 - Base：`e63cb37b2`，Mooncake elastic EP recovery 集成点
-- Git status：提交后应为 clean；继续工作前必须重新执行 `git status --short`
+- Git status：提交后 clean；继续工作前必须重新执行 `git status --short`
 
 关键提交：
 
 ```text
-<PENDING_FT_COMMIT_SHORT> fix(ft): track node watchdog leases and paused ranks
+aa88dae21 fix(ft): fail-stop unattended pauses on every node
+f9c3bef80 fix(ft): track node watchdog leases and paused ranks
 81d859af6 docs(ft): record elastic-ep revert, rejoin port guard, watchdog style rationale
 74cafe366 fix(ft): coordinate scheduler pause at MLP sync
 a2eb77550 debug(ft): add opt-in scheduler stack signal
@@ -105,6 +106,7 @@ python/sglang/srt/managers/scheduler.py
 python/sglang/srt/managers/tokenizer_manager.py
 python/sglang/srt/model_executor/model_runner.py
 python/sglang/srt/server_args.py
+python/sglang/srt/utils/common.py
 python/sglang/srt/utils/watchdog.py
 python/sglang/srt/elastic_ep/elastic_ep.py
 python/sglang/srt/eplb/expert_location.py
@@ -151,7 +153,7 @@ e0d6dbf docs(sglang): define final-head rerun queue
 当前架构由两个 runtime 事实源、一个控制面意图集合和一个派生路由组成：
 
 ```text
-process_active_ranks[dp]     本地 watchdog / rejoin DPC 提供
+process_active_ranks[dp]     child exit 或 node lease DOWN；rejoin DPC 显式 UP
 mooncake_active_ranks[dp]    Mooncake rank membership 投影到 DP 提供
 disabled_dp_ranks            上层 scale_down 写入，显式 recover 删除
 
@@ -231,11 +233,11 @@ dp_rank = tp_rank // (A * C)
 | --- | --- | --- | --- |
 | HTTP server | 暴露 `/fault_tolerance/status`、`/fault_tolerance/apply`，执行 admission gate | 无独立 FT 状态 | 不决定 rank 是否可用 |
 | `TokenizerManager` | Node 0 控制面入口，汇总 scheduler/DPC 消息，转发最终路由 | 持有 `FaultToleranceManager` | 不自行推导状态 |
-| `FaultToleranceManager` | 异步编排 pause/resume、路由 ACK、apply 请求、node heartbeat lease 和 fail-stop | pending command/future、`node_rank -> (last_seen, dp_ranks)` lease | 不把 heartbeat 当成第三套 DP 可用性模型 |
+| `FaultToleranceManager` | 异步编排 pause/resume、路由 ACK、apply 请求、node heartbeat lease 和控制命令失败后的 fail-stop | pending command/future、`node_rank -> (last_seen, dp_ranks)` lease | 不持有成功 pause 后的等待 deadline，不把 heartbeat 当成第三套 DP 可用性模型 |
 | `FaultToleranceState` | 纯状态与状态转移 | process/Mooncake runtime 事实、disabled 控制意图、paused 临时控制及派生状态 | 不做 IPC |
 | `DataParallelController` | Node 0 路由；每节点启动本地 scheduler；FT 命令转发；初始/周期 heartbeat 与本地 process-DOWN 上报 | 本地 child `Process` 对象、DP route mask、watchdog-thread 私有 ZMQ sender | 不拥有全局 FT 状态 |
 | `SubprocessWatchdog` | 每秒轮询本地 child；执行 exit callback 和 `on_poll` heartbeat | 本地已上报 index 集合、stop event | 不推导全局 node/DP 状态 |
-| `Scheduler` | 执行 batch；响应 DP 级 pause/resume；上报 exception 和 Mooncake DP membership | 本 rank 运行状态 | 不决定全局路由，不撤销控制面隔离 |
+| `Scheduler` | 执行 batch；响应 DP 级 pause/resume；上报 exception 和 Mooncake DP membership；检查成功 pause 后的本地 deadline | 本 rank 运行状态、`_ft_pause_deadline` | 不决定全局路由，不撤销控制面隔离；deadline 到期只通知本节点 main process 清理本地进程树 |
 | `ModelRunner` / Mooncake | 维护 global rank membership，执行 inference-driven recovery | rank 级 active mask | 不维护上层 `disabled_dp_ranks` |
 
 ### 3.4 类图
@@ -284,7 +286,8 @@ classDiagram
     }
 
     class DataParallelController {
-        +scheduler_process_infos
+        +scheduler_procs
+        +scheduler_process_dp_ranks
         +status
         +send_fault_tolerance_command()
         +update_active_ranks()
@@ -303,9 +306,12 @@ classDiagram
     }
 
     class Scheduler {
+        +_ft_pause_deadline
         +handle_fault_tolerance_command()
         +run_batch()
         -_run_event_loop_fault_tolerance()
+        -_check_ft_pause_deadline()
+        -_complete_ft_pause()
     }
 
     class ModelRunner {
@@ -374,6 +380,8 @@ flowchart TB
 
 一个节点可有多个 DP，一个 DP也可跨节点。watchdog 只保存本节点真实 `Process` 对象，不需要远程 PID。
 
+每个 Scheduler 都是本节点 DPC 的 child，DPC 又是本节点 main process 的 child。成功 pause 后，各 Scheduler 独立维护同样的 monotonic deadline；到期时 `notify_node_main_process_failure()` 从 Scheduler 定位 parent DPC 和 grandparent node main，并向本节点 main process 发送 `SIGQUIT`。既有 node-main signal handler 随后清理本节点进程树。该路径不需要 Node 0 广播退出，也不要求一个 DPC 代表所有物理节点。
+
 ### 3.6 消息模型
 
 | 消息 | 发送者 | 接收者 | 语义 |
@@ -426,16 +434,26 @@ apply HTTP -> TokenizerManager -> FaultToleranceManager
 - Node 0 首次收到 heartbeat 时固定记录 `node_rank -> sorted(unique local dp_ranks)` 和接收端 monotonic 时间，后续同节点 heartbeat 只刷新时间。每秒扫描一次，5 秒未刷新则合并所有过期节点的 DP，调用一次现有 `ProcessActiveRanksOutput(active=false)` 处理路径。
 - heartbeat 本身永远不把 process 标为 true；late heartbeat 只重新注册 lease。process-UP 仍只能由 rejoin DPC 的 ready 路径显式上报。
 
+成功 pause 后的超时退出不是 `SoftWatchdog`、`HardWatchdog` 或 `SubprocessWatchdog` 的新分支，也不是 FT manager 的 `asyncio.TimerHandle`。它是每个 Scheduler event loop 检查的 monotonic deadline：无需新增线程或 IPC，且每个节点都能独立通知自己的 node main。`SubprocessWatchdog` 仍只负责 child 存活轮询和 heartbeat；`HardWatchdog`/`SoftWatchdog` 仍负责既有 forward-progress 监控。
+
 ### 3.8 scheduler 控制语义
 
-FT manager 发送的是 DP 级命令。Node 0 DPC 把命令送到目标 DP leader socket，scheduler 层在对应 attention TP/CP block 内执行和汇总：
+FT manager 发送的是 DP 级命令。Node 0 DPC 把命令送到目标 DP leader socket：
 
-- `pause`：设置 `_engine_paused=True`。
-- `resume`：设置 `_engine_paused=False`。
-- attention TP/CP block 内所有成员聚合执行结果。
-- 只有 `attn_tp_rank == 0 && attn_cp_rank == 0` 返回一个 DP 级 ACK。
+- `pause`：scheduler 先保存 `_ft_pending_pause`，通过既有 MLP-sync 传播粘滞 `PAUSE_READY`；全部预期 runtime-active target ready 后才设置 `_engine_paused=True`。每个完成 pause 的 Scheduler 都启动 `_ft_pause_deadline`，随后仅由 `attn_tp_rank == 0 && attn_cp_rank == 0` 返回 DP 级 ACK。
+- `resume`：目标 scheduler 直接设置 `_engine_paused=False` 并清除 `_ft_pause_deadline`，由 leader 返回 DP 级 ACK；当前不再使用 DP 内 `all_gather_object` 聚合 member 结果。
+- pause 需要 ACK，因为控制面必须确认幸存 DP 已在不会继续进入下一轮 collective 的安全边界停住；resume ACK 用于完成 apply 控制事务。
 - 命令发送不受当前路由 mask 限制，否则已关闭路由的 DP 无法被 resume。
 - pause/resume 超时或失败后，FT 控制面 fail-stop；不继续信任半完成的 DP 状态。
+- pause 已成功完成但在 `fault_tolerance_pause_timeout` 内没有收到后续 resume 时，每个 Scheduler 独立调用 `notify_node_main_process_failure()`，由本节点 main process 执行本地 fail-stop。该路径不依赖 Node 0 再向其他节点发退出通知。
+- full-TP control broadcast 不能绕过 DP leader 故障：leader-dead sibling 在 `recv_requests` 中先等待本 DP leader 发起的 work broadcast，永远走不到后续 control broadcast。
+
+这里必须区分两种外观相似、支持结论不同的时序：
+
+- **leader 是首个故障**：故障 DP 可被关闭路由，live sibling 不被连带 kill；若该 DP 从未进入本轮 paused 集合，健康 DP 可以在隔离后继续服务。现有 `A=2` GPU 用例只覆盖这一时序。
+- **DP 已 paused 或 pause/resume 尚未完成，leader 再死亡**：当前不支持。FT 命令只投递到 leader，ACK 也只由 leader 返回；此时不能证明 live sibling 已收到 resume，也不能证明其 collective phase 与健康 DP 一致。
+
+后一时序不是单纯的“故障 DP 无法恢复”。若按 DP 粒度的 `runtime_active` 快照把它从 `resume_targets = paused_dp_ranks ∩ runtime_active_ranks` 中排除，live sibling 可能继续停在 paused/旧 collective phase；若仍向它发送 resume，则 leader socket 不可达或无法返回 ACK。健康 DP 随后恢复请求并进入下一轮全局 MLP/EP collective 时，可能因 phase 不一致被该 sibling 拖住。因此该场景的故障半径可能扩展到健康 DP，不能依据“leader 首故障后 DP0 仍能生成”的通过结果推断为受支持。
 
 ### 3.9 为什么 FT manager 必须绑定 TokenizerManager 的 event loop
 
@@ -504,9 +522,11 @@ process 或 Mooncake 有效路由出现 true -> false 的下降沿时：
 1. 故障 DP 立即从最终路由移除，显示 `DEAD`。
 2. FT manager 向其余 runtime-active DP 发 pause。
 3. pause ACK 后，`paused_dp_ranks` 直接等于实际 ACK 集合；运行中变 inactive 的 target 不再要求 ACK。
-4. 普通推理 admission 返回 503。
-5. `/fault_tolerance/status`、`/fault_tolerance/apply`、`/health`、`/metrics`、`/ping` 保持可访问。
-6. 上层执行 `retry` 或 `scale_down`；`recover` 只负责撤销已有逻辑隔离，不替代这两个 pause 恢复命令。
+4. 每个实际完成 pause 的 Scheduler 都已独立启动本地 deadline。
+5. 普通推理 admission 返回 503。
+6. `/fault_tolerance/status`、`/fault_tolerance/apply`、`/health`、`/metrics`、`/ping` 保持可访问。
+7. 上层在 deadline 前执行 `retry` 或 `scale_down`，其 resume 命令清除对应 Scheduler deadline；`recover` 只负责撤销已有逻辑隔离，不替代这两个 pause 恢复命令，也不会清除 deadline。
+8. deadline 到期仍未 resume 时，各 Scheduler 分别通知本节点 main process 执行 fail-stop。
 
 重复 process/Mooncake false 不产生第二次下降沿；已有 pause 或 operation 时也不会重复发 pause。
 
@@ -544,7 +564,7 @@ process 或 Mooncake 有效路由出现 true -> false 的下降沿时：
 3. 不能隔离掉全部 runtime-active DP。
 4. 先把 ranks 加入 `disabled_dp_ranks`。
 5. 若最终路由发生变化，先下发 route mask 并等待 Node 0 DPC ACK。
-6. resume 所有 runtime-active paused DP，包括仍存活的 scale-down ranks。
+6. resume `paused_dp_ranks ∩ runtime_active_ranks`，包括仍存活的 scale-down ranks。
 7. runtime-inactive ranks 不等待 resume ACK；它们已经无法参与执行。
 8. 全部 resume 成功后整体清空 `paused_dp_ranks`；runtime-active target 显示 `DISABLED`，runtime-inactive target 仍显示 `DEAD`。路由发布失败或 resume 失败时保留原 paused 集合。
 9. 存活的 scale-down rank 不接收真实请求，仍进入必要的 idle/EP/collective forward。
@@ -601,6 +621,7 @@ scheduler event loop 中的 Python exception：
 | recover 目标不是 disabled rank | 400 |
 | apply 路由更新失败 | 503 |
 | pause/resume 命令超时或失败 | 控制面 fail-stop |
+| pause 已成功完成，但上层在 pause deadline 前未执行有效的 retry/scale-down | 每个节点由本地 Scheduler 通知 node main fail-stop |
 
 ### 4.8 启动配置约束
 
@@ -615,12 +636,17 @@ scheduler event loop 中的 Python exception：
 - Ray engine
 - DP attention 下 `tp_size` 不能被 `dp_size * attn_cp_size` 整除
 
+本轮 heartbeat lease 和控制命令设计只以 DP-attention FT 为支持范围。代码 gate 尚未单独拒绝 `enable_dp_attention=false`，这不等于 no-DP-attention 多节点通道已获支持；相关配置不能仅凭“可以启动”对外宣称可恢复。
+
 默认：
 
 ```text
 fault_tolerance_on_error_strategy = pause
 fault_tolerance_timeout = 60 seconds
+fault_tolerance_pause_timeout = 300 seconds
 ```
+
+对应 CLI 参数为 `--fault-tolerance-timeout` 和 `--fault-tolerance-pause-timeout`。`fault_tolerance_timeout` 限制 pause/resume 命令和 ACK 等控制事务；`fault_tolerance_pause_timeout` 从每个 Scheduler 实际完成 pause 时开始计时，限制服务成功暂停后等待上层处置的时间；既有 `watchdog_timeout` 则用于 forward-progress watchdog。三者不能互相替代。
 
 ### 4.9 功能支持矩阵
 
@@ -635,10 +661,11 @@ fault_tolerance_timeout = 60 seconds
 | --- | --- | --- | --- |
 | watchdog 静态感知 scheduler 退出 | `A>=1`，单/多节点 | 单个本地 scheduler clean/non-clean 退出，DPC 仍存活 | 新实现设计支持；既有 GPU 证据只覆盖旧实现的非正常退出，新 clean-exit 分支目前仅有单测 |
 | 同节点其他 DP 保活 | `D>N` | kill 一个 DP 的 scheduler | `D=4,N=1` 有 status-only 证据；`D=4,N=2` 旧契约有完整组合证据，显式 recover 版本待重跑 |
-| 同一 DP 其他成员保活 | `A>1` | kill DP 内一个 global rank | `T=4,D=2,N=1,A=2` 已在最终 `74cafe366` 回归通过 |
+| 同一 DP 其他成员保活 | `A>1` | kill DP 内一个 global rank | `T=4,D=2,N=1,A=2` 已在最终 `74cafe366` 回归通过；只覆盖 leader 作为首故障时 sibling 不被 kill 和健康 DP继续服务 |
 | `continue` 自动移除故障 DP | `A>=1` | process 或 Mooncake inactive | `D=4,N=1` process kill 和 `A=1,D=N=4` 整节点 Mooncake fallback 均已在最终 `74cafe366` 通过 |
-| `pause -> retry` | `A>=1` | process fault 或 exception | process kill 与 recoverable exception 两个独立场景均已在最终 `74cafe366` 通过 |
-| `pause -> scale_down` | `A>=1` | DP 粒度逻辑隔离 | 设计支持；单节点 `A=1/A=2` 有历史证据，`D=4,N=2` 旧契约有完整流程证据，显式 recover 版本待重跑 |
+| `pause -> retry` | `A>=1` | process fault 或 exception | process kill 与 recoverable exception 两个独立场景均已在最终 `74cafe366` 通过；要求本次 FT 操作期间不再发生局部故障，所有待 resume DP 的 leader 可达 |
+| `pause -> scale_down` | `A>=1` | DP 粒度逻辑隔离 | 设计支持；单节点 `A=1/A=2` 有历史证据，`D=4,N=2` 旧契约有完整流程证据，显式 recover 版本待重跑；不覆盖 paused DP 的 leader 二次死亡 |
+| 成功 pause 后无人处置超时 | DP attention，单/多节点 | 超过 `fault_tolerance_pause_timeout` 未收到 resume | 代码与本地单测已覆盖 deadline 启动、取消、到期单次通知和 Scheduler grandparent 信号目标；逻辑多节点 GPU 与真实多机 fail-stop 尚待验证 |
 | 显式 `recover` | `A>=1` | 撤销 `disabled_dp_ranks`，runtime 决定最终路由 | 健康 DP scale-down/recover、暂停态 recover 与 runtime-inactive recover 已有最终 HEAD GPU 证据 |
 | scale-down 释放 GPU | 任意 | 主动 scale-down | 不支持 |
 | 整个远端节点直接消失的静态检测 | DP attention 多节点 | DPC 和 watchdog 一起消失，无推理 | 新实现设计支持：5 秒 heartbeat lease 超时后按 node→DP 映射 process-DOWN；待 GPU/真实多机验证 |
@@ -678,9 +705,9 @@ sequenceDiagram
     participant SCH as Surviving schedulers
     participant API as Upper-layer API
 
-    OS->>WD: scheduler sentinel ready, exitcode != 0
+    OS->>WD: scheduler process exits (clean or non-clean)
     WD->>TM: ProcessActiveRanksOutput([dp], false)
-    Note over WD: 发送后保留 2s grace；不 kill 其他 child
+    Note over WD: watchdog-thread persistent PUSH；不 kill 其他 child
     TM->>FM: observe_process_active_ranks()
     FM->>ST: process_active[dp] = false
     ST-->>FM: falling edge + pause targets
@@ -688,6 +715,7 @@ sequenceDiagram
     TM->>DPC: ActiveRanksOutput(effective mask)
     FM->>DPC: FaultToleranceCommand(pause, live DP targets)
     DPC->>SCH: DP-scoped pause
+    SCH->>SCH: each Scheduler arms local pause deadline
     SCH-->>FM: one ACK per DP
     FM->>ST: finish_pause(acked)
     API->>TM: GET /fault_tolerance/status
@@ -699,8 +727,9 @@ sequenceDiagram
     DPC-->>FM: route update ACK
     FM->>DPC: resume(other runtime-active paused DPs)
     DPC->>SCH: DP-scoped resume
+    SCH->>SCH: clear local pause deadline
     SCH-->>FM: resume ACKs
-    FM->>ST: commit_recover()
+    FM->>ST: commit_recover(clear paused set)
     FM-->>API: healthy survivors, scaled DP=dead
 ```
 
@@ -709,36 +738,71 @@ sequenceDiagram
 - kill 是故障注入；`scale_down` 是故障发生后的上层决策，两者不能颠倒。
 - process kill 后自动 pause，不需要 exception 注入。
 - `scale_down` 不再触发物理 shutdown。
+- 正常 apply 在 deadline 前 resume survivors 并清除各自的本地 deadline。
 
-### 5.2 Mooncake fallback
+### 5.1.1 成功 pause 后无人处置 -> 每节点本地 fail-stop
 
-当整个远端节点进程组一起消失，本地 DPC/watchdog 也消失，不能向 Node 0 发送 process false。此时只能依赖 survivor inference：
+```mermaid
+sequenceDiagram
+    autonumber
+    participant FM as Node0 FaultToleranceManager
+    participant S0 as Node0 Scheduler
+    participant S1 as Node1 Scheduler
+    participant N0 as Node0 main process
+    participant N1 as Node1 main process
+
+    FM->>S0: pause
+    FM->>S1: pause
+    S0->>S0: complete pause and arm local deadline
+    S1->>S1: complete pause and arm local deadline
+    S0-->>FM: DP ACK
+    S1-->>FM: DP ACK
+    Note over S0,S1: no retry / scale_down resume before timeout
+    S0->>N0: SIGQUIT via notify_node_main_process_failure()
+    S1->>N1: SIGQUIT via notify_node_main_process_failure()
+    N0->>N0: clean local process tree
+    N1->>N1: clean local process tree
+```
+
+该机制是分布式的本地 deadline，不是 Node 0 统一定时后跨节点 kill。只有已经完成 pause 的 Scheduler 才会启动 deadline；若 Node 0 在 pause 广播前死亡、节点失联或 Scheduler 自身已死亡，该路径不能代替外部 launcher、heartbeat lease 或其他故障处置。
+
+### 5.2 整节点 heartbeat lease 与 Mooncake 后续收敛
+
+整个远端节点进程组一起消失时，本地 DPC/watchdog 确实无法再发送 process false；但它此前已向 Node 0 注册 node→DP 映射并持续续租，因此控制面不再依赖下一次推理才能发现故障：
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant EXT as External framework
     participant NODE as Remote node group
+    participant FM as Node0 FT manager
     participant SUR as Surviving scheduler
     participant MC as Mooncake
-    participant TM as TokenizerManager / FT
     participant DPC as Node0 DPC
 
+    NODE->>FM: initial heartbeat(node_rank, local DPs)
+    loop every 1s
+        NODE->>FM: heartbeat refresh
+    end
     EXT-xNODE: stop/crash whole remote node group
-    Note over NODE,TM: 无本地 watchdog 消息可达 Node0
-    EXT->>SUR: next normal inference
+    Note over NODE,FM: heartbeat stops; no process-DOWN message is required
+    FM->>FM: 5s lease timeout, map node_rank to affected DPs
+    FM->>FM: ProcessActiveRanksOutput(affected DPs, false)
+    FM->>DPC: effective route update
+    alt pause strategy
+        FM->>DPC: pause runtime-active DP
+    else continue strategy
+        Note over FM,DPC: survivors continue serving
+    end
+    Note over FM,DPC: the control-plane fault transition requires no forward
+    EXT->>SUR: later survivor/recovery forward
     SUR->>MC: dispatch/combine
     MC-->>SUR: rank active bits fall to false
-    SUR->>TM: ActiveRanksOutput(DP-projected mask)
-    TM->>DPC: effective route update
-    alt pause strategy
-        TM->>DPC: pause runtime-active DP
-    else continue strategy
-        Note over TM,DPC: survivors continue serving
-    end
+    SUR->>FM: ActiveRanksOutput(DP-projected mask)
+    Note over FM,MC: Mooncake membership and expert layout converge
 ```
 
-因此，“静态 kill scheduler”已增强为无推理感知；“整个节点消失”仍是 inference-driven fallback。
+heartbeat lease 只负责 process 事实和控制面隔离；Mooncake 仍负责 global-rank membership、专家重排和真实 forward 恢复。process-DOWN 故意不把 Mooncake cache 清 false，所以 Mooncake fallback/下一次 forward 是后续收敛路径，而不是整节点故障的唯一检测入口。
 
 ### 5.3 外部节点重启与 rejoin
 
@@ -756,8 +820,9 @@ sequenceDiagram
 
     EXT-xOLD: recovery 阶段停止完整非0节点进程组
     EXT->>NEW: 以 elastic_ep_rejoin 启动同一 node rank
+    NEW->>TM: WatchdogHeartbeatOutput(node_rank, local DP ranks)
     NEW->>TM: ProcessActiveRanksOutput(local DP ranks, true)
-    Note over NEW,TM: DPC 在 child 创建并启动 watchdog 后即上报；不代表 Mooncake 已恢复
+    Note over NEW,TM: heartbeat 先注册 lease；process-UP 不代表 Mooncake 已真实恢复
     NEW->>MC: replacement ranks enter join_group
     SUR->>MC: one explicitly routed survivor forward calls try_recover_ranks
     MC-->>NEW: join completes
@@ -777,11 +842,11 @@ sequenceDiagram
 约束：
 
 - 恢复单位是完整节点进程组，不是单独 spawn 一个 scheduler。
-- rejoin DPC 的 process true 上报早于 replacement rank 完成 Mooncake join；它只是进程事实源恢复，不能单独开放路由。
+- rejoin DPC 在 ready 前先发 initial heartbeat，scheduler ready 后再发 process true；两者都不代表 Mooncake rank 已完成 join。
 - replacement scheduler 进入 `join_group` 后仍可能等待 survivor 推理推进恢复。
 - 测试必须等待 replacement ranks 确实进入 Mooncake join，再发 recovery-drive。
 - recovery-drive 必须显式路由到已确认存活的 survivor DP；整节点停止到 Mooncake 刷新之间存在旧状态窗口，不能用普通负载均衡请求碰运气。
-- `ProcessActiveRanksOutput(active=true)` 不能单独打开路由。
+- 若 Mooncake cache 已是 false，`ProcessActiveRanksOutput(active=true)` 不能单独打开路由；若故障仅由 lease 检测、Mooncake cache 仍为旧 true，它可能在首个 recovery forward 前恢复派生路由。这是当前有意接受的缓存语义，不能误写成 fresh Mooncake recovery 已完成。
 - Mooncake recovery 只恢复 runtime 事实；若 DP曾被 scale-down，必须显式 `recover`，不能依赖 rejoin 自动清除 disabled。
 - `recover` 不发送 scheduler resume；若目标仍 paused，必须另行 `retry`。
 - 若在 replacement ranks 尚未就绪前反复发 survivor 请求，Mooncake 可能先确认新的 rank fault；`pause` 策略会暂停 survivors，之后 HTTP gate 持续返回 503。发生这种状态时应先检查 `/status` 和日志，必要时 apply `retry` 恢复 survivors，再执行一次 recovery-drive，不能盲目循环 503。
@@ -815,13 +880,14 @@ sequenceDiagram
 
 以下方案不属于当前架构，禁止因旧代码或旧用例重新引入：
 
-- 一个 scheduler 故障清理全部本地进程。
+- 把一个 scheduler 的普通 child-exit 直接升级为清理全部本地进程。成功 pause 后无人处置超时是独立的服务级 fail-stop，不属于该已否决方案。
 - `scale_down.shutdown`。
 - `DPSupervisor`、远程 PID 代理和跨节点进程镜像。
 - 用 `awaiting_native_down` 串行化 watchdog 与 Mooncake 两个事实源。
 - Mooncake true、process true 或 recovered-rank 事件自动清除 `disabled_dp_ranks`；控制授权只能由显式 `recover` 撤销。
 - 在 process-kill 用例里用 exception 替代进程退出。
 - rejoin 未就绪时持续发送 recovery-drive。
+- 关闭 local control、改走 full-TP control broadcast 来恢复 leader-dead sibling；sibling 在更早的本 DP work broadcast 已阻塞，控制消息无法到达。
 
 每项方案的失败原因和历史证据见 [ARCHITECTURE_GRAVEYARD.md](./ARCHITECTURE_GRAVEYARD.md)。
 
@@ -852,7 +918,7 @@ sequenceDiagram
 前 10 个 output token IDs 完全一致
 ```
 
-控制面状态转换、pause/resume ACK 和单次 recovery-drive 超过 120 秒通常视为功能问题。server 冷启动可单独设置更长边界，但不得把 600 秒控制步骤超时用于掩盖状态机错误。
+控制面状态转换、pause/resume ACK 和单次 recovery-drive 超过 120 秒通常视为功能问题。server 冷启动可单独设置更长边界，但不得把 600 秒控制步骤超时用于掩盖状态机错误。这里的 120 秒是验证控制命令能否及时完成的测试边界，不是成功 pause 后允许等待上层处置的产品参数；后者由 `fault_tolerance_pause_timeout` 控制，默认 300 秒，超时将触发节点级 fail-stop。
 
 ### 7.2 已通过规格矩阵
 
@@ -860,7 +926,7 @@ sequenceDiagram
 | --- | --- | --- |
 | `T=4,D=4,N=1,A=1` process kill，continue | 故障 DP 路由关闭，只少一个 scheduler，DP0/2/3 与各自 baseline 的前 10 token 一致 | 最终 `74cafe366` 通过；run `final-a-process-kill-continue-20260721-203234-45269` |
 | `T=4,D=4,N=1,A=1` process kill，pause -> retry/scale-down | pause admission、dead route、scheduler count、三个 survivor 精度 | 两个变体均在最终 `74cafe366` 通过；run ID 见 `VALIDATION_HISTORY.md` 第 7 节 |
-| `T=4,D=2,N=1,A=2` sibling 保留 | kill global rank2 后 rank3 仍存活且专家布局未被错误删除，DP0 输出一致 | 最终 `74cafe366` 通过；run `final-d-a2-sibling-retention-20260721-211021-55709` |
+| `T=4,D=2,N=1,A=2` sibling 保留 | leader global rank2 作为首故障被 kill 后，rank3 未被连带 kill、专家布局未被错误删除，DP0 输出一致 | 最终 `74cafe366` 通过；DP1 在本轮故障前未处于 paused，该用例只证明 sibling 保留和此特定时序下健康 DP正确性；不证明 pause 后 leader 二次死亡时 sibling 可被 resume，也不证明该时序不会阻塞健康 DP；run `final-d-a2-sibling-retention-20260721-211021-55709` |
 | `T=4,D=4,N=2,A=1` pause -> scale-down -> rejoin -> recover | DP2 隔离不杀 DP3；runtime recovery 后 DP2 保持 DISABLED；显式 recover 后四 DP HEALTHY | 在 `296deb012` 通过；11/11 精度准确；最终 HEAD 待统一回归 |
 | `T=4,D=4,N=4,A=1` watchdog -> rejoin，static dispatch | DP3 退出、survivors 精度、recovery-drive、rejoined DP3 前 10 token、最终全 healthy | 在诊断 HEAD `11f55a00a` 连续通过两次；仅为单机逻辑四节点 |
 | `T=2,D=2,N=2,A=1` watchdog -> rejoin，static dispatch | 整个逻辑 node1 退出、watchdog 上报、DP0 degraded 精度、recovery-drive、rejoined DP1 10-token、最终双 healthy | 最终 `74cafe366` 连续通过两次；关闭核心 static rejoin 结论，不外推原 `N=4/D=4` 映射或三 survivor 聚合 |
@@ -877,33 +943,66 @@ sequenceDiagram
 
 A-J 的拓扑、故障步骤、逐项断言、超时约束和 remote-agent 命令统一维护在 [ACCEPTANCE_TEST_SPEC.md](./ACCEPTANCE_TEST_SPEC.md)。主 README 不复制可执行流程，防止架构规格和脚本细节并行演化后互相矛盾。
 
+### 7.4 2026-07-31 node lease / paused deadline 语义的本地验证
+
+当前 `worktree-dp-only-ft-revise@aa88dae21f74eb1ed5d9fbfe9b0c779e5d8c57b2` 已完成：
+
+```text
+controller file-level unit tests:        16 passed
+manager file-level unit tests:           20 passed
+scheduler/DPC AST + mock tests:           17 passed
+watchdog file-level threaded checks:      passed
+all changed Python files py_compile:      passed
+focused Ruff F401/F821:                   passed
+git diff --check:                         passed
+```
+
+覆盖点包括首次 heartbeat 在 DPC ready 前注册、同线程持久 sender、lease 注册/刷新/5 秒边界、多节点超时 DP union、late heartbeat 不执行 UP、Mooncake cache 保持不变、clean/non-clean exit DOWN、pause ACK 精确集合，以及 retry/scale-down 成功整体清 paused、失败/recover 保留 paused。新增 pause deadline 单测还覆盖每个 Scheduler 完成 pause 后启动 deadline、重复完成不延后 deadline、resume 取消、到期只通知一次，以及 `notify_node_main_process_failure()` 向 Scheduler grandparent（本节点 main process）发送 `SIGQUIT`。
+
+这只是本地控制流验证，不是 GPU 或真实多机结论。Windows 的 SGLang import 链依赖 Unix-only `resource`，完整 `test_subprocess_watchdog.py` 仍需 Linux CI 运行。旧 `74cafe366` GPU evidence 不能直接外推到本轮 node lease 实现。
+
 ## 8. Immediate Next Steps
 
 本节是后续执行进度的唯一任务源；`ACCEPTANCE_TEST_SPEC.md` 维护验收步骤，remote-agent suite 只维护脚本和运行命令。不要把“四卡脚本”误解为所有结论都必须使用四张卡；判断标准是缩小拓扑是否保留了待验证机制和断言。
 
-1. 最终 HEAD `74cafe366` 尚未完成的优先门：
+### 8.1 本轮提交的优先验证门
+
+1. Linux CI 运行真实 watchdog 单测：
+   `PYTHONPATH=python python -m pytest test/registered/unit/utils/test_subprocess_watchdog.py -q`。
+2. 多节点 DP-attention 服务启动后，在**不发 forward**的条件下退出完整非 0 节点；期望约 5 秒 lease 超时后受影响 DP process=false、路由关闭，并按策略自动 pause/continue。
+3. 覆盖 `D>N`：一个失联 node 映射多个 DP，超时只隔离其 DP union，其他节点 DP保持存活。
+4. 覆盖 clean scheduler exit：即使 `exitcode==0`，FT DPC 仍立即下报该 DP DOWN，且不触发默认 SIGQUIT。
+5. 覆盖 rejoin 的两种 Mooncake cache：
+   - cache=false：process-UP 后路由保持关闭，forward recovery 后恢复；
+   - lease-only cache=true：process-UP 可先恢复派生路由，首个 forward 必须完成真实 Mooncake membership/专家重排。
+6. 覆盖成功和失败事务：retry/scale-down 成功后 paused 集合为空；route publish 失败、resume 失败和 recover 后 paused 保留。
+7. 覆盖 pause deadline 的逻辑多节点和真实多机路径：成功 pause 后不发 apply，期望每个节点在配置时限后分别由本地 Scheduler 通知 node main，所有节点本地进程树退出；同时验证 deadline 前 retry/scale-down 不误退出。
+8. `A*C>1` 只验证已承诺边界：完整 DP退出/重拉可以继续推进；leader 死亡而 sibling 残存必须明确判为不支持，不能误报恢复成功。
+
+### 8.2 继承的历史回归队列
+
+1. 历史验证 HEAD `74cafe366` 尚未完成的优先门：
    - **N2 colocated-DP isolation/rejoin/recover**：必须四卡。需要在 `D=4,N=2,A=1` 中 kill DP2、保留同节点 DP3，完整重启 node1 后确认 DP2 仍 `DISABLED`，显式 recover 后才 `HEALTHY`。上次 run 只完成 DP0 baseline 后 SSH 中断，不计 PASS。
    - 两卡 static watchdog/rejoin 与 exception + overlap/TBO discard 均已在最终 HEAD 各连续通过两次，不再列为待跑。详细 run ID 和排除的诊断样本见 `VALIDATION_HISTORY.md` 第 8 节。
-2. 最终 HEAD 仍值得补跑的历史 P0 核心：noFT kill 原生隔离、单请求 exception continue、in-flight kill continue、in-flight kill pause/retry、双 kill 后一次 multi-rank scale-down、连续 scale-down 到单 DP。前四项可以做明确的两 DP 变体；后两项至少需要三 DP，优先使用现有四卡脚本。
+2. 当前提交仍值得补跑的历史 P0 核心：noFT kill 原生隔离、单请求 exception continue、in-flight kill continue、in-flight kill pause/retry、连续 scale-down 到单 DP。前四项可以做明确的两 DP 变体；连续 scale-down 至少需要三 DP，优先使用现有四卡脚本。
 3. 高价值 P1：无 paused rank 的 apply 拒绝、scale-down 后 retry 拒绝、non-Mooncake 启动拒绝/noFT fail-stop、noFT 原生 rejoin、DeepSeek BF16 精度。API/fail-stop 和一节点一 DP rejoin 可以两卡执行；DeepSeek 降配时必须保持 BF16/DeepGEMM 实际路径和严格精度断言。
-4. P2 不阻塞前三项；有余量时补 pause 超时 fail-stop、重复 process/native down 幂等、active-mask 立即路由和 all-false 快速失败。历史 `20260708` 的 23/23 本就没有包含 P2，不能把 P2 描述成已在旧全量中通过。
+4. P2 不阻塞前三项；pause 超时 fail-stop 已完成代码与本地单测，仍需按 8.1 的多节点门补运行证据。其余 P2 包括重复 process/native down 幂等、active-mask 立即路由和 all-false 快速失败。历史 `20260708` 的 23/23 本就没有包含这些 P2，不能把它们描述成已在旧全量中通过。
 5. 已补齐整节点 fallback 的 `continue` 分支，以及 J.2/J.3/J.16/J.17 live 入口；继续核对 J 类剩余条目的 unit/live 证据边界。
    - scale-down 健康 DP后，确认其不再接收请求但仍参与 idle/EP/collective forward。
    - status、resume ACK、survivor 精度和 scheduler 存活必须同时断言。
-6. 重跑连续双 process kill -> multi-rank scale-down，验证 pending pause target 收缩修复。
-7. 明确 EP dispatch 的产品策略，不要直接把测试 A/B 当成最终修复。
+6. 明确 EP dispatch 的产品策略，不要直接把测试 A/B 当成最终修复。
    - correctness/determinism 优先时，可把 `--ep-dispatch-algorithm static` 作为候选启动模式。
    - 若必须保留 dynamic 的逐 token 副本负载分摊，需要设计稳定、可重放的副本选择，不能继续依赖进程本地 `torch.randint` 状态。
    - 在策略确定前，不修改正式用例默认值，也不放宽 10-token 严格断言。
-8. 若继续修 dynamic，沿已经钉住的首个差异边界向下定位。
+7. 若继续修 dynamic，沿已经钉住的首个差异边界向下定位。
    - 对同一逻辑 expert 比较 baseline/rejoin 的物理副本、dispatch row 顺序、每个 expert 的 token count、GEMM 输入行序和 combine 顺序。
    - 区分“换了等价副本”与“同一批 token 的执行顺序变化”；前者解释物理 ID，后者更可能解释 DeepGEMM 数值放大。
    - 成功标准不是单次 token 相等，而是 dynamic 下连续多次严格通过，并能解释或消除 layer 0 `moe_output` 差异。
-9. 把 static A/B 固化成显式回归，而不是偷偷改变 suite 默认值。
+8. 把 static A/B 固化成显式回归，而不是偷偷改变 suite 默认值。
    - 参数仅使用 `SGLANG_FT_EP_DISPATCH_ALGORITHM=static`，其余模型、冗余专家数、故障步骤和比较条件保持不变。
    - 首次 cold-path 运行允许单独预热，但正式 evidence run 仍使用 one-shot、短 curl 和有界 case timeout。
    - 至少连续通过两次，所有 precision JSON 必须为 `accurate=true`。
-10. `T=4,D=2,N=1,A=2` 已在最终 `74cafe366` 通过；不要再把它列作待跑。单节点 process-kill continue 也已补齐 scheduler count 和各 survivor 精度，不再只是旧 status-only 证据。
+9. `T=4,D=2,N=1,A=2` 已在最终 `74cafe366` 通过；不要再把它列作待跑。单节点 process-kill continue 也已补齐 scheduler count 和各 survivor 精度，不再只是旧 status-only 证据。
 
 后续 agent 开始工作前应先阅读本文，不要从旧 suite 描述或旧用例名字反推设计。
 
@@ -917,26 +1016,39 @@ A-J 的拓扑、故障步骤、逐项断言、超时约束和 remote-agent 命�
 
 Mooncake recovery 需要 survivor forward。v6 证明在 replacement ranks 尚未进入 join 前驱动推理，可能先产生新的 membership fault并 pause survivors；v8、v9 证明等待两个 replacement rank 的 Mooncake join 日志后，再使用一次显式 survivor recovery-drive 可以完成恢复。当前应把 join readiness 和显式 survivor 路由保持为测试与外部恢复流程约束，不需要据此新增内部 recovery admission 路径。
 
-### 9.3 整节点静态故障没有 Node 0 主动探针
+### 9.3 整节点静态故障已改为 heartbeat lease
 
-整个远端节点消失时，本地 watchdog 也消失。当前可接受行为是由下一次推理触发 Mooncake fallback，未来可以由：
+每个 FT DPC 在 ready 前发送初始 heartbeat，之后 watchdog 每秒刷新。Node 0 维护接收端 monotonic 时间，5 秒过期后按首次注册的 node→DP 映射复用 process-DOWN；因此完整远端节点消失不再要求 survivor forward 才关闭控制面路由。
 
-- 上层检测后主动 scale-down；
-- Node 0 新增探针；
+仍需验证的风险：
 
-补足静态检测。本阶段不实现。
+- 初始 heartbeat 没有接收 ACK。它在持久 PUSH 上、先于 DPC ready 入队，正常服务启动后足够建立 lease；但不能把“集群尚未完成启动时节点立刻死亡”宣称为严格已覆盖。
+- 5 秒 timeout 是固定实现值，真实网络抖动下可能误判；当前没有 generation 或租约协商。
+- heartbeat endpoint、Mooncake transport 和真实跨机故障尚无本轮 GPU/多机证据。
+- 旧 `74cafe366` 的整节点 fallback 证据仍证明 Mooncake survivor-forward 路径，但不证明新的静态 lease 路径。
 
-该 fallback 的 pause 分支已在 `74cafe366` 连续通过两次；continue 分支也已通过一次。两者都先 kill 完整 logical node3 进程组，再由 survivor forward 触发 Mooncake 上报；continue 的触发请求本身可返回 200，因此验收契约是后续 DEAD 状态，不是固定 HTTP 503。
-
-### 9.4 A>1 rejoin 不在承诺范围
+### 9.4 A>1 leader 边界与 whole-DP rejoin
 
 当前 process source 是 DP bool，不保存每个进程的恢复计数；Mooncake source按 DP 内所有 global rank active bit 的积投影。旧 recovered-DP 映射链路已经删除，所以部分 rank 不会再直接清除 disabled；只要 Mooncake DP mask 尚未完整恢复，最终 runtime 状态仍为 DEAD。
 
 因此：
 
-- A>1 的 process fault、scale-down 和 sibling 保留可以支持。
-- recover 可以先于 runtime 完整恢复执行，但不会绕过 runtime mask；所有 rank 恢复后才可能 HEALTHY。
-- A>1 rejoin 不得因某个偶然通过的用例直接宣布支持。
+- A>1 的 process fault 可以关闭故障 DP且不 kill sibling，但“进程仍存活”不等于 sibling event loop 可继续工作。
+- DP leader 死亡而 sibling 残存时，sibling 先阻塞在以 leader 为 source 的本 DP work broadcast，无法走到 full-TP control 或 next batch；heartbeat/resume target 都不能解决。
+- 若整个 DP 的全部成员都退出，不存在残存 sibling 卡住，node lease + whole-DP rejoin 控制流可以推进；该路径仍需端到端验证后才能承诺。
+- recover 可以先于 runtime 完整恢复执行，但不会绕过 runtime mask或 disabled 授权。
+
+必须按故障发生时序解释支持范围：
+
+| 时序 | 当前行为与风险 | 支持结论 |
+| --- | --- | --- |
+| leader 是首个故障，故障 DP 未进入 paused | 关闭整个故障 DP 的请求路由，保留 live sibling；已有用例中健康 DP 可继续生成 | 限定支持；仅证明隔离、sibling retention 和该用例中的健康 DP正确性 |
+| 非 leader 成员故障，leader 仍可接收并 ACK FT 命令 | 可按 DP 粒度进入 pause/retry 或 scale-down，但不承诺残缺 DP rejoin | 限定支持，仍要求 FT 操作期间无第二次局部故障 |
+| DP 已 paused，随后 leader 死亡且 sibling 残存 | DP 可能从 resume target 中被排除；若不排除，resume 又无法经 leader 完成投递与 ACK。sibling 可能停留在 paused/旧 collective phase，并在后续全局 MLP/EP collective 中拖住健康 DP | 不支持 |
+| pause/resume 命令执行中 leader 死亡 | 控制面无法区分命令未送达、部分成员已执行和 ACK 丢失，现有协议也没有 generation/member completion 证明 | 不支持，超时后 fail-stop |
+| 整个 DP 全部成员退出后整组重启 | 没有旧 sibling 残留在 collective；node lease 与 whole-DP rejoin 控制流可继续 | 设计路径，尚未完成端到端验证 |
+
+因此，`A=2` 的 leader-kill 通过用例不能外推为“任意时刻 kill leader 均受支持”。当前协议要支持 paused/执行中 leader 故障，至少需要解决不依赖固定 leader 的命令入口、成员级完成证明，以及 work/control/MLP collective 的阶段一致性；只把 control broadcast 扩成 full-TP 不足以闭环。
 
 ### 9.5 recover 路由发布失败不回滚控制状态
 
@@ -944,7 +1056,7 @@ Mooncake recovery 需要 survivor forward。v6 证明在 replacement ranks 尚�
 
 ### 9.6 `exitcode == 0`
 
-watchdog 忽略 clean exit。当前故障测试使用 SIGKILL/SIGTERM 等非零退出。若未来有 scheduler 以 0 退出但仍应视为不可用，需要重新定义 clean shutdown 协议，不能简单删除分支。
+通用 `SubprocessWatchdog` 默认仍忽略 clean exit，保持原调用方兼容；FT DPC 显式设置 `report_clean_exit=true`，因此 scheduler 以 0 退出也调用 process-DOWN callback，但不会触发 SIGQUIT。该分支已有本地单测，尚需 Linux 真实子进程测试。
 
 ### 9.7 测试进度文档必须跟随运行证据更新
 
@@ -967,6 +1079,24 @@ watchdog 忽略 clean exit。当前故障测试使用 SIGKILL/SIGTERM 等非零�
 
 当前可确认的是“无 FT 的 same-prefix cache-hit 计算路径存在确定性分叉”；尚未区分 radix cache、KV slot、TBO/overlap 或其他缓存命中语义。该问题归入 SGLang 原生问题，已发布为团队 StackOverflow [#37](https://github.com/gaidandawang-afk/stackoverflow/issues/37)，不在本 DP-only FT 项目中继续定位或修复；不能把它计入 exception/TBO FT 门，也不能通过放宽或缩短正式 precision 断言规避。运行证据见 `VALIDATION_HISTORY.md` 第 8 节。
 
+### 9.10 process-DOWN 保留旧 Mooncake true
+
+本轮明确不在 process-DOWN 时清空 `mooncake_active_ranks`。好处是 process 和 Mooncake 仍由各自真实事件更新，没有控制面伪造 Mooncake false；代价是 lease-only 故障尚未经过 forward 时，Mooncake cache 可以保持旧 true，rejoin process-UP 后派生路由可能早于 fresh Mooncake recovery 打开。
+
+这不是 heartbeat 自动 UP：heartbeat 从不修改 process mask。测试必须区分“派生 route 已打开”和“Mooncake membership/专家重排已在首个 forward 完成”，不能把前者当作后者的证据。
+
+### 9.11 pause deadline 的覆盖边界
+
+`fault_tolerance_pause_timeout` 只覆盖“Scheduler 已成功完成 pause，但后续一直没有收到 resume”的状态。每个 Scheduler 使用本地 monotonic clock，并在 event loop 中检查 deadline；到期后通过 `notify_node_main_process_failure()` 向本节点 main process 发送 `SIGQUIT`，由既有 signal handler 清理本节点进程树。它不依赖 Node 0 在超时点仍然存活，也不需要新增跨节点退出消息。
+
+仍需保留以下边界：
+
+- 只有完成 `_complete_ft_pause()` 的 Scheduler 才会启动 deadline；pause 命令未送达、Scheduler 已死亡或节点已失联时，不能依赖该 deadline。
+- pause/resume 命令自身失败或 ACK 超时仍是 FT manager 的控制事务 fail-stop，与“成功 pause 后无人处置”是两条路径。
+- 多节点没有共享 deadline 或全局退出 ACK，各节点依据本地时钟分别退出；真实多机上可能存在短暂退出偏差。
+- 当前只有本地单测证明 deadline 和 grandparent 信号目标，尚无逻辑多节点 GPU 或真实多机证据证明所有节点最终退出。
+- Node 0 / Tokenizer 控制面在 pause 广播前死亡仍不在本设计覆盖范围内。
+
 ## 10. 文档索引
 
 - 详细验收步骤：[ACCEPTANCE_TEST_SPEC.md](./ACCEPTANCE_TEST_SPEC.md)
@@ -975,5 +1105,6 @@ watchdog 忽略 clean exit。当前故障测试使用 SIGKILL/SIGTERM 等非零�
 - 调试方法与常见误判：[DEBUGGING_EXPERIENCE.md](./DEBUGGING_EXPERIENCE.md)
 - 正常流程与冗余审查：[NORMAL_FLOW_REVIEW.md](./NORMAL_FLOW_REVIEW.md)
 - 已否决架构方案：[ARCHITECTURE_GRAVEYARD.md](./ARCHITECTURE_GRAVEYARD.md)
+- 逐批代码审查与本轮实现追踪：[FT_REVISE_PLAN.md](./FT_REVISE_PLAN.md)
 
 主 README 只维护当前架构、已通过规格、证据边界和开放风险，不再追加逐轮运行流水账。
