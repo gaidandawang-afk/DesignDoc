@@ -46,7 +46,7 @@
 - 中心不发送 `pause`，不维护 `paused_dp_ranks`，不做 MLP-sync `PAUSE_READY` 全局 pause barrier。
 - 不保存 Mooncake active mask 的控制面权威副本。
 - 不引入 provisional active、`recover_commit`、incarnation、sequence、retired generation、owner pin。
-- 不加 shutdown ACK、grace period 或 lease-DOWN 补 ACK。scale-down 的 EPLB 阶段必须增加幸存者请求边界同步；这不是中心发送通用 pause，也不改变 shutdown 的 process-DOWN 完成条件。
+- 不做两阶段/三阶段 scale-down，不加 shutdown ACK、grace period 或 lease-DOWN 补 ACK。pause 策略下由“全部 candidate survivor 已 self-pause 为 `unhealthy`”这一调用前置条件保证 Scheduler 已离开上一轮 forward/Mooncake operation。
 - `recover` 不向 Scheduler 下发命令、不重排专家、不做 topology expansion。
 - `retry` 不携带 active mask、不接受 Mooncake 上报、不触发 EPLB。
 - 不实现非预期异常窗口的健壮性分支（见第 1.4 节的"不要求处理"）；生产代码保持精简，不为这些窗口引入防御分支。
@@ -173,7 +173,7 @@ expected == true 且 dp in unhealthy_dp_ranks      -> unhealthy
 - **heartbeat 永不把 false 位恢复为 true**；只有 rejoin DPC 的显式 `ProcessActiveRanksOutput(active=true)`（ProcessUp）恢复进程位。
 - **Mooncake active 不进入控制面拓扑**。它只驱动两件事：(1) fn2，把恢复完成的 rank 移出 pending；(2) `continue` 策略下参与 route 合成与 auto-recover。它**不能**改写 pause 策略下的 `expected_dp_mask`。
 - **`disabled` 不是存储锁存，而是派生显示态**：`expected=false` 且 replacement Scheduler 完成 native join/ready、DPC 发出 ProcessUp 后，DP 即显示 `disabled`。当前原生启动屏障使 ProcessUp 晚于 survivor recovery-drive，因此端到端 rejoin 通常不会暴露 `disabled` 且仍 pending 的窗口；`recover` 仍必须独立检查 `pending_recovery`，该防线由状态机单测覆盖。
-- **scale-down 的 shutdown/拓扑提交仍是一次事务，但 EPLB 前后必须做幸存者 cohort 同步**：owner DPC kill 目标 DP 全部 local Scheduler → 等 watchdog 把这些 global rank 标 DOWN → 每个幸存 Scheduler 到达安全请求边界并 park，确认不再处理上一轮 Mooncake operation → 全体确认后安装同一稀疏 global mask + 强制 EPLB rebalance + 快照到 `last_active_ranks`，并保持 parked → 收齐完成 ACK 后发布 route → release 全部幸存者 → 提交 expected。现有 `b7c6f9229` 尚未实现该同步，见 7.3。
+- **scale-down 是单阶段，但有严格的 survivor self-pause 前置条件**：process kill 后，必须先用已在执行的 forward 让全部 candidate survivor 穿过 membership-loss 异常边界并显示 `unhealthy`；随后 owner DPC kill 目标 DP 的其余 local Scheduler → 等 watchdog 把这些 global rank 标 DOWN → 幸存者安装稀疏 global mask + 强制 EPLB rebalance + 快照到 `last_active_ranks` → 发布 route → 提交 expected。仅看到 process-DOWN 或 HTTP 503 不满足前置条件。
 - 被 scale-down 移除的 DP 后续退出**不形成新 incident**，因为 `has_incident()` 只检查 expected DP。
 
 ### 3.2 拓扑术语
@@ -564,20 +564,19 @@ watchdog 先更新 `process_alive_mask`，中心据此关闭请求入口；幸�
 
 ### 4.4 `scale_down`
 
-`scale_down(ranks)`：整 DP 移除；控制事务必须在强制 EPLB 前同步全部幸存 Scheduler 的请求边界。
+`scale_down(ranks)`：单阶段整 DP 移除。pause 策略下，调用者必须先确认全部 candidate survivor 已 self-pause 为 `unhealthy`。
 
 1. 必须已有 incident（exception 或 process-down），否则 `scale_down_requires_incident`。
 2. `ranks` 必须非空（`scale_down_requires_ranks`）、全部当前 `expected=true`（`scale_down_requires_expected_ranks`）。
 3. 不能移除全部 expected DP（`cannot_scale_down_all_expected_ranks`）。
 4. `candidate = expected_dp_mask - requested`。
-5. **shutdown**：对拥有目标 global rank 的 owner DPC 发 `FaultToleranceDPCShutdownReqInput`，每个 DPC kill 目标 DP 的全部本地 Scheduler；等原 watchdog 把每个 requested global rank 标 DOWN（`_shutdown_waiter` 满足）。没有 shutdown ACK、grace period 或 lease 代 ACK——shutdown 完成条件直接复用 process-DOWN 事实。
-6. **request-boundary prepare/park**：向 candidate（幸存 expected DP）下发 prepare；每个幸存 Scheduler 只有在退出上一轮 forward/Mooncake fault cleanup、到达可执行 FT control 的安全请求边界后才回 prepared ACK，并在该边界等待同一事务的 commit。中心必须收齐 candidate 全部 prepared ACK；任一超时沿用事务 fail-stop。
-7. **scale-down commit**：向已经 prepared 的 candidate 下发同一事务的 commit，携带 `expand_dp_mask(candidate)` 稀疏 global mask；幸存者安装 mask、强制 EPLB rebalance、快照到 `last_active_ranks`，但继续保持 parked；收集每个幸存 DP 的完成 ACK。commit 不得在首个 survivor prepared 时提前执行，任一 survivor 也不得在全体完成前恢复 forward。
+5. pause 策略下，全部 candidate 必须已上报 recoverable membership-loss fault 并显示 `unhealthy`。process-DOWN 触发的中心 admission 503 不是 Scheduler self-pause ACK；在 candidate 仍为 `healthy` 时调用属于不满足前置条件。exact `b7c6f9229` 尚未在 API 中拒绝该误用，因此当前调用者和测试必须先轮询状态。
+6. **shutdown**：对拥有目标 global rank 的 owner DPC 发 `FaultToleranceDPCShutdownReqInput`，每个 DPC kill 目标 DP 的全部本地 Scheduler；等原 watchdog 把每个 requested global rank 标 DOWN（`_shutdown_waiter` 满足）。没有 shutdown ACK、grace period 或 lease 代 ACK——shutdown 完成条件直接复用 process-DOWN 事实。
+7. **scale_down 命令**：向 candidate 下发一个 `scale_down`，携带 `expand_dp_mask(candidate)` 稀疏 global mask；已 self-pause 的幸存者安装 mask、强制 EPLB rebalance、快照到 `last_active_ranks`、清 pause/deadline；收集每个幸存 DP 的 ACK。
 8. **发布 route**：`publish DPC route = candidate`，等 Node 0 DPC ACK。
-9. **release**：向 candidate 下发同一事务的 release，清 pause/deadline并收齐 ACK；此时 admission 仍由 `ft_operation_in_progress` 关闭。
-10. **提交**：`expected_dp_mask = candidate`，清 `unhealthy_dp_ranks`，清 `ft_operation_in_progress`。
+9. **提交**：`expected_dp_mask = candidate`，清 `unhealthy_dp_ranks`，清 `ft_operation_in_progress`。
 
-只用一个 DPC control endpoint 发送 kill 请求；request-boundary prepare/park 只服务于本次 scale-down 的 survivor cohort，不建立公共 `paused` 状态、不新增中心通用 pause 命令，也不改变自暂停架构。实现可以使用 prepare+commit，或证明具备相同 barrier 语义的等价机制；关键不变量是任何 survivor 开始新的 EPLB collective 前，全部 candidate 已离开上一轮 Mooncake operation。
+只用一个 DPC control endpoint 发送 kill 请求；没有 prepare/rebalance/release 三阶段命令。安全边界来自调用前已观测到全部 candidate `unhealthy`，而不是在 scale_down 内重新建立 pause barrier。
 
 外部可以先 kill 任意 Scheduler，再对该失活 global rank 所属 DP 调用 `scale_down`；`scale_down` 会继续 kill 该 DP 的其余 sibling。完成后该 DP 状态保持 `dead`；完整节点重拉后仍保持 `dead`，直到 survivor forward 完成原生数据面恢复、replacement Scheduler 穿过 ready barrier 并由 DPC 上报 ProcessUp，才显示 `disabled`。
 
@@ -664,7 +663,7 @@ fault_tolerance_pause_timeout = 300 seconds
 | `A*C>1` kill 一个 sibling | `A>1` | kill DP 内一个 global rank | 设计支持：整 DP 先投影 `dead`；`scale_down` 继续 kill 其余 sibling。单测覆盖 shutdown kill 全部本地成员 |
 | exception 自暂停 + 本地 deadline | `A>=1` | recoverable exception | 设计支持；单测覆盖"先置 pause/deadline 再上报"、到期单次通知 node main |
 | `retry`（maskless） | `A>=1` | recoverable exception，无真实进程故障 | 设计支持；单测覆盖 maskless、用 expected 拓扑、拒绝进程丢失 |
-| `scale_down`（整 DP） | `A>=1` | 已有 incident，移除非空 expected 子集 | 设计目标：shutdown 后先收齐 survivor request-boundary prepared ACK，再统一 commit 稀疏 mask 和 EPLB；收齐完成 ACK、发布 route 后才 release。现实现只发单命令，GPU 连续收缩已证明不满足 cohort 安全性 |
+| `scale_down`（单阶段整 DP） | `A>=1` | 已有 incident，移除非空 expected 子集；pause 策略要求全部 candidate survivor 已 `unhealthy` | 设计支持；GPU 连续收缩在每轮等待全部 survivor self-pause 后通过。exact `b7c6f9229` 尚未由 API 强制校验该前置条件 |
 | `4->3` 后 exception `retry` | `D>=4` | scale-down 后再 exception | 设计支持：始终保留三实例，被移除 DP 不可路由 |
 | `recover` | `A>=1` | 目标已拉回且数据面 ready（members ∩ pending = ∅），仅提交 expected + route | 设计支持；进程就绪即显示 disabled，pending 单独做 ready 闸 |
 | rejoin | `A=1,C=1`，整个非 0 节点进程组外部重启 | Mooncake rank recovery + 原生 EPLB | 设计支持；pause 走 `disabled -> recover -> healthy`，continue 由 fn2 auto-recover |
@@ -775,7 +774,7 @@ sequenceDiagram
 
 - kill 是故障注入；`scale_down` 是故障发生后的上层决策，两者不能颠倒。
 - process kill 后中心**不发送 pause**；幸存 Scheduler 靠 membership-loss 检查自暂停。
-- `scale_down`：shutdown（复用 process-DOWN，无独立 ACK）→ 幸存者 request-boundary prepare/park → 收齐 cohort ACK → commit 稀疏 mask、强制 EPLB 并保持 parked → 收齐完成 ACK → 发布 route → release → 提交 expected。
+- `scale_down`：调用前确认全部 candidate survivor `unhealthy` → shutdown（复用 process-DOWN，无独立 ACK）→ 幸存者单命令安装稀疏 mask、强制 EPLB、清 pause → 发布 route → 提交 expected。
 - 正常 apply 在 deadline 前 resume survivors 并清除各自的本地 deadline（经 retry/scale_down 命令里的清 deadline）。
 
 ### 5.2.1 成功自暂停后无人处置 -> 每节点本地 fail-stop
@@ -887,7 +886,7 @@ sequenceDiagram
 - DP 粒度的权威 mask（如 `mooncake_active_ranks`、DP 级 `process_active_ranks`）。本设计只维护 global-rank 粒度的 `process_alive_mask`。
 - 把 `disabled` 做成存储锁存集合（`disabled_dp_ranks`）。`disabled` 只是 `¬expected ∧ process-alive` 的派生显示态；"数据面是否 ready"由反向的 `pending_recovery` 记录，由 fn1（process-down 加入）/ fn2（native-active 移除）维护。
 - provisional active、`recover_commit`、incarnation、sequence、retired generation、owner pin。
-- shutdown ACK、grace period、lease-DOWN 补 ACK。这里不再排除 scale-down 内部的 request-boundary prepare/commit；7.3 的 GPU 证据已证明强制 EPLB 前缺少 cohort barrier 会死锁。
+- 两阶段/三阶段 scale-down、shutdown ACK、grace period、lease-DOWN 补 ACK。7.3 的 GPU 证据把安全边界收敛为调用前全部 candidate survivor 已完成 self-pause，而不是新增中心 barrier。
 - `scale_down.shutdown` 参数、`DPSupervisor`、远程 PID 代理、跨节点 shutdown RPC / 进程镜像。
 - 用 `awaiting_native_down` 串行化 watchdog 与 Mooncake 两个事实源。
 - 在 pause 策略下让 Mooncake true、process true 或 recovered-rank 事件自动翻 `expected`（pause 必须显式 `recover`）；continue 策略相反，fn2 自动 recover 是设计语义，不属于本节边界。
@@ -921,7 +920,7 @@ sequenceDiagram
 `codex/ft-self-pause-minimal@b7c6f9229` 已含两类 file-level 单测（共 23 项），覆盖点如下：
 
 - `test_controller.py`（9 项）：`dp_size=1` 拒绝、非法 DP-attention 拓扑拒绝、process mask 保持 global-rank 粒度、稀疏 expected mask 展开为整 DP block、exception 记 unhealthy 而无 paused 态、rejoin 进程就绪即 disabled（pending 仅拦 recover）、被排除 dead DP 不产生新 incident、pause admission 由 cluster_paused+operation 决定、continue admission 不被故障暂停。
-- `test_manager.py`（14 项）：retry maskless 且用 expected 拓扑、retry 拒绝进程丢失、当前 scale-down 实现 shutdown 后仅一个 scheduler 阶段、scale-down 发送稀疏 global mask、recover 只提交 expected+route、recover 在数据面 pending 时拒绝、recover 在 unhealthy 时拒绝、ProcessUp 单独不开放 rejoined DP、continue route 三者求交、continue native 恢复自动 recover、watchdog lease 过期标 global 进程 DOWN、shutdown 完成来自 process-DOWN、命令按目标 DP 收 ACK、rank_fault 只更新 unhealthy。连续收缩 GPU 失败已证明“单命令”测试只能描述当前实现，不能证明修改后的 4.4 设计不变量。
+- `test_manager.py`（14 项）：retry maskless 且用 expected 拓扑、retry 拒绝进程丢失、当前 scale-down 实现 shutdown 后仅一个 scheduler 阶段、scale-down 发送稀疏 global mask、recover 只提交 expected+route、recover 在数据面 pending 时拒绝、recover 在 unhealthy 时拒绝、ProcessUp 单独不开放 rejoined DP、continue route 三者求交、continue native 恢复自动 recover、watchdog lease 过期标 global 进程 DOWN、shutdown 完成来自 process-DOWN、命令按目标 DP 收 ACK、rank_fault 只更新 unhealthy。现有单测尚未覆盖“pause 策略下全部 candidate 必须 unhealthy”的 API 前置条件；该边界目前由 GPU 用例在调用侧强制。
 
 **证据边界**：以上是脱离 sglang 包的 file-level 单测（Windows 无法完整 pytest，因 SGLang import 链依赖 Unix-only `resource`），是状态机控制流验证，不是 GPU 或真实多机结论，也不构成 Linux/pytest 通过证据。
 
@@ -935,15 +934,16 @@ sequenceDiagram
 
 两次 `result.json` 均为 `exit_code=0`、`assertions_pass=true`、源码 clean。该证据确认本设计的单机逻辑多节点 rejoin 时序；它不替代真实跨机网络、heartbeat lease 和节点失联验证，第 4.9、4.10 节超出上述断言的部署结论仍保持限定状态。
 
-同日继续在 exact `b7c6f9229` 上执行其余 13 个 active contract。12 个用例通过，连同上述两条 rejoin，当前总计 **14/15 active contracts 通过、成功用例 428/428 结构化断言通过**。唯一失败是 `fault-kill-pause-continuous-scale-down`。后续针对该用例完成了容量校正、v6 对照和两层日志定位：
+同日继续在 exact `b7c6f9229` 上执行其余 13 个 active contract，并按 survivor self-pause 前置条件修正、重跑 `fault-kill-pause-continuous-scale-down`。当前 **15/15 active contracts 均至少有一次冷启动 PASS，最新成功运行合计 466/466 结构化断言通过**。连续缩容用例的定位与修正过程如下：
 
 - 初始 profile 的 `SGLANG_FT_EP_NUM_REDUNDANT_EXPERTS=128` 不足以支持 EP4 收缩到单 rank。Qwen 有 128 个 logical experts，单 survivor 必须容纳全部 logical experts，因此必要下界是 `128 * (4 - 1) = 384`。这解释了配置错误，但不解释校正后的 hang。
-- exact `b7c6f9229` 改为 redundant=384 后，两次独立冷启动分别在 `3 -> 2` 和 `4 -> 3` 超时，均无 OOM。debug `8dd277bd6` 的两次冷启动一过一败；失败轮只有 DP2 进入 model-runner/EPLB，说明问题具有时序性而非固定发生在第三轮。
-- delivery debug `9f9a8254d` 在 `3 -> 2` 再次复现：Node 0 DPC 对 DP0、DP3 的 ZMQ send 都记录 begin/end；DP0 Scheduler 收到命令并立即进入 `rebalance(force=True)`，DP3 没有记录收到命令。此前 DP2 被 kill 后，Mooncake 显示 DP3 正在处理 `marking peer 2 as broken during transferring op 5`，而 DP0 已完成 `damaged sync phase`；DP3 在 180 秒内没有回到 Scheduler command consumption boundary。
-- 因而命令没有丢在 DPC sender。v7 的单命令 handler 让先消费命令的 survivor 直接进入新 EPLB collective，而其他 survivor 仍可能滞留在上一轮 Mooncake fault operation，造成 collective cohort 错位和死锁。根因是强制 EPLB 前缺少 survivor request-boundary park/barrier。
-- 团队知识库已有三个相符记录：[issue #7](https://github.com/gaidandawang-afk/stackoverflow/issues/7) 说明连续收缩到单 rank 需要 384 redundant experts，[issue #21](https://github.com/gaidandawang-afk/stackoverflow/issues/21) 记录 request-boundary park 的必要性，[issue #22](https://github.com/gaidandawang-afk/stackoverflow/issues/22) 记录 post-park Mooncake collective skew；本轮日志为后两者在 exact v7 HEAD 上补充了直接因果证据。
-- v6 control `1d85efdad` 使用相同 GPU 4,5,6,7、模型、redundant=384、ratio=0.45、static dispatch、Mooncake 和 kernel 目录，并执行当前用例的同一阶段与断言；只通过 harness adapter 转换 v6 legacy apply/status wire schema。有效冷启动 `continuous-current-case-v6-1d85efdad-gpu4567-20260810-r4` 全部通过。v6 在恢复 Scheduler 后由后续 forward 触发 EPLB，天然先回到请求边界；该 A/B 排除了环境和用例顺序是主因，并把回归范围收敛到 v7 的同步 forced-EPLB 路径。
-- 所有失败均完成 owned process-group cleanup，未清理或控制他人进程。debug 分支只增加观测日志，尚未实现修复；旧版本 PASS 不能直接作为 v7 PASS，但可作为环境与用例的对照证据。
+- exact `b7c6f9229` 改为 redundant=384 后，旧用例的两次冷启动分别在 `3 -> 2` 和 `4 -> 3` 超时，均无 OOM。旧用例在 process-DOWN 或中心 HTTP 503 后允许 survivor 仍为 `healthy`，因而可能过早提交 `scale_down`。
+- delivery debug `9f9a8254d` 在 `3 -> 2` 捕获了这一顺序：Node 0 DPC 对 DP0、DP3 的 ZMQ send 均完成；DP0 Scheduler 已消费命令并进入 `rebalance(force=True)`，DP3 仍在处理上一轮 peer 2 故障的 Mooncake `op 5`，尚未到达 membership-loss 检查和 Scheduler command consumption boundary。这里 `_forward_raw` 不是偶发地忽略异常，而是尚未从旧 collective 返回，Python 检查点没有执行。
+- 修正后的用例在每轮 kill 前启动 DP0 in-flight stream 并确认进入 decode；kill 后分别严格等待 `0/2/3=unhealthy`、`0/3=unhealthy`、`0=unhealthy`，然后才调用 `scale_down`。有效冷启动 `continuous-unhealthy-barrier-b7c6f9229-gpu4567-20260810-r2` 中，三轮 apply 均返回 HTTP 200，所有 candidate 均记录 EPLB begin/end，三次缩容后的 DP0 generation 与精度 oracle 全部通过，共 38/38 断言。
+- 这证明 exact v7 的单阶段 forced-EPLB 在“全部 candidate survivor 已 self-pause”前置条件下可以完成；此前 hang 是调用顺序违反该前置条件的负例，不再支持“v7 必须增加 prepare/commit/release 协议”的结论。当前 API 尚不检查该前置条件，过早 apply 仍可能挂住，这是需要保留的接口风险。
+- 团队知识库 [issue #7](https://github.com/gaidandawang-afk/stackoverflow/issues/7) 对 384 redundant experts 的容量结论仍直接适用；[issue #21](https://github.com/gaidandawang-afk/stackoverflow/issues/21) 和 [issue #22](https://github.com/gaidandawang-afk/stackoverflow/issues/22) 描述的 collective cohort 风险可作为“不得过早 apply”的负例背景，但本轮证据不要求在 scale-down 内新增中心 barrier。
+- v6 control `1d85efdad` 使用相同 GPU、模型与当前用例阶段并通过。v6 的恢复路径由后续 forward 触发 EPLB，天然较晚到达重排点；它既是环境对照，也解释了为何旧用例顺序在 v6 上不易暴露窗口，但不能证明 v7 的早 apply 顺序有效。
+- 所有运行均完成 owned process-group cleanup，未清理或控制他人进程。连续缩容目前只有一次符合新前置条件的冷启动 PASS；按用例稳定性契约还需两次独立冷启动 PASS 才满足三次验收要求。
 
 ## 8. Immediate Next Steps
 
@@ -952,7 +952,7 @@ sequenceDiagram
 ### 8.1 最小验收用例（normative）
 
 1. exception -> `unhealthy` -> maskless `retry` -> `healthy`，全程无 EPLB。
-2. kill 一个 Scheduler -> `dead` -> `scale_down`，目标整个 DP 退出。
+2. kill 一个 Scheduler -> `dead` -> 等全部 candidate survivor `unhealthy` -> `scale_down`，目标整个 DP 退出。
 3. `A*C>1` 时 kill 一个 sibling，`scale_down` 后同 DP 全部 sibling 退出。
 4. `4 -> 3` 后 exception `retry`，始终保留三实例且被移除 DP 仍不可路由。
 5. `scale_down` 后按完整 nnode rejoin：replacement 等待 native join 时保持 `dead`；survivor recovery-drive 后，pause 走 `disabled -> recover -> healthy`，continue 由 fn2/ProcessUp 汇合后 auto-recover。
@@ -963,12 +963,12 @@ kill 用例不得替代 retry 用例；`retry` 只能用 exception 注入验证�
 
 ### 8.2 优先验证门
 
-1. 修复已定位的连续 scale-down cohort 错位：在任何 survivor 执行稀疏 mask + `rebalance(force=True)` 前，必须确认所有 candidate 已离开上一轮 Mooncake operation 并 park 在同一安全请求边界；随后统一 commit 并保持 parked，收齐 EPLB 完成 ACK、发布 route 后才统一 release。补充 prepare/commit/release 状态机和超时单测，并用 redundant=384 至少三次独立冷启动完整复验 `4 -> 3 -> 2 -> 1`；保留 DPC send、Scheduler receive/prepare、Mooncake op、EPLB begin/end 和 apply waiter 的同轮证据。
+1. 用 redundant=384 再执行两次独立冷启动 `4 -> 3 -> 2 -> 1`，每轮均在 apply 前断言全部 candidate survivor 为 `unhealthy`，使符合新契约的累计 PASS 达到三次；保留 Mooncake membership-loss、Scheduler self-pause、EPLB begin/end 和 apply waiter 的同轮证据。
 2. Linux CI 运行真实单测：`PYTHONPATH=python python -m pytest test/registered/unit/fault_tolerance/ test/registered/unit/utils/test_subprocess_watchdog.py -q`。
 3. 进程粒度投影：kill 一个 Scheduler，确认 `process_alive_dp_mask` 把整 DP 投影为 `dead`，且 `A*C>1` 时 sibling 一并被 scale-down kill。
 4. 自暂停路径：exception 注入后确认幸存 Scheduler `_engine_paused`、本地 deadline 启动、中心无 pause 命令；`retry`/`scale_down` 在 deadline 前清除 deadline。
 5. 成功自暂停后无人处置：逻辑多节点与真实多机上，每个节点在 `fault_tolerance_pause_timeout` 后由本地 Scheduler 通知 node main，所有节点本地进程树退出；deadline 前 retry/scale-down 不误退出。
-6. scale-down cohort 同步：确认 shutdown 仍无独立 ACK；每个 candidate 离开上一轮 Mooncake operation 并 prepared 后，才允许统一 commit、强制 rebalance 和快照 `last_active_ranks`；收齐完成 ACK、发布 route 后才 release 并提交 expected。
+6. scale-down cohort 同步：确认 shutdown 仍无独立 ACK；调用前所有 candidate 已通过 membership-loss 异常自暂停为 `unhealthy`，随后单阶段命令完成强制 rebalance 和 `last_active_ranks` 快照，收齐完成 ACK、发布 route 并提交 expected。若决定把前置条件从调用契约提升为 API 强制校验，再补“candidate 仍 healthy 时返回 400”的状态机单测。
 7. rejoin 两种策略路径：先证明 replacement 进程存在但控制面仍 `dead`，再由 survivor forward 完成 native join；pause 随后走 `disabled -> recover -> healthy`（recover 前须 `members ∩ pending = ∅`），continue 由 fn2/ProcessUp 状态汇合后 auto-recover；ProcessUp 单独不开放 route。
 8. Mooncake dispatcher `first_execution` 复位：rank mask 变化后首个 dispatch 重新握手，不沿用旧 handle。
 9. `A*C>1` 只验证已承诺边界：整 DP 退出/重拉可推进；leader 死亡而 sibling 残存必须明确判为不支持，不能误报恢复成功。
