@@ -939,11 +939,11 @@ sequenceDiagram
 - 初始 profile 的 `SGLANG_FT_EP_NUM_REDUNDANT_EXPERTS=128` 不足以支持 EP4 收缩到单 rank。Qwen 有 128 个 logical experts，单 survivor 必须容纳全部 logical experts，因此必要下界是 `128 * (4 - 1) = 384`。这解释了配置错误，但不解释校正后的 hang。
 - exact `b7c6f9229` 改为 redundant=384 后，旧用例的两次冷启动分别在 `3 -> 2` 和 `4 -> 3` 超时，均无 OOM。旧用例在 process-DOWN 或中心 HTTP 503 后允许 survivor 仍为 `healthy`，因而可能过早提交 `scale_down`。
 - delivery debug `9f9a8254d` 在 `3 -> 2` 捕获了这一顺序：Node 0 DPC 对 DP0、DP3 的 ZMQ send 均完成；DP0 Scheduler 已消费命令并进入 `rebalance(force=True)`，DP3 仍在处理上一轮 peer 2 故障的 Mooncake `op 5`，尚未到达 membership-loss 检查和 Scheduler command consumption boundary。这里 `_forward_raw` 不是偶发地忽略异常，而是尚未从旧 collective 返回，Python 检查点没有执行。
-- 修正后的用例在每轮 kill 前启动 DP0 in-flight stream 并确认进入 decode；kill 后分别严格等待 `0/2/3=unhealthy`、`0/3=unhealthy`、`0=unhealthy`，然后才调用 `scale_down`。有效冷启动 `continuous-unhealthy-barrier-b7c6f9229-gpu4567-20260810-r2` 中，三轮 apply 均返回 HTTP 200，所有 candidate 均记录 EPLB begin/end，三次缩容后的 DP0 generation 与精度 oracle 全部通过，共 38/38 断言。
+- 修正后的用例在每轮 kill 前启动 DP0 in-flight stream 并确认进入 decode；kill 后分别严格等待 `0/2/3=unhealthy`、`0/3=unhealthy`、`0=unhealthy`，然后才调用 `scale_down`。三个独立冷启动 `continuous-unhealthy-barrier-b7c6f9229-gpu4567-20260810-r2`、`...-acceptance-01` 和 `...-acceptance-02` 中，三轮 apply 均返回 HTTP 200，所有 candidate 均记录 EPLB begin/end，三次缩容后的 DP0 generation 与精度 oracle 全部通过，每次均为 38/38 断言。
 - 这证明 exact v7 的单阶段 forced-EPLB 在“全部 candidate survivor 已 self-pause”前置条件下可以完成；此前 hang 是调用顺序违反该前置条件的负例，不再支持“v7 必须增加 prepare/commit/release 协议”的结论。当前 API 尚不检查该前置条件，过早 apply 仍可能挂住，这是需要保留的接口风险。
 - 团队知识库 [issue #7](https://github.com/gaidandawang-afk/stackoverflow/issues/7) 对 384 redundant experts 的容量结论仍直接适用；[issue #21](https://github.com/gaidandawang-afk/stackoverflow/issues/21) 和 [issue #22](https://github.com/gaidandawang-afk/stackoverflow/issues/22) 描述的 collective cohort 风险可作为“不得过早 apply”的负例背景，但本轮证据不要求在 scale-down 内新增中心 barrier。
 - v6 control `1d85efdad` 使用相同 GPU、模型与当前用例阶段并通过。v6 的恢复路径由后续 forward 触发 EPLB，天然较晚到达重排点；它既是环境对照，也解释了为何旧用例顺序在 v6 上不易暴露窗口，但不能证明 v7 的早 apply 顺序有效。
-- 所有运行均完成 owned process-group cleanup，未清理或控制他人进程。连续缩容目前只有一次符合新前置条件的冷启动 PASS；按用例稳定性契约还需两次独立冷启动 PASS 才满足三次验收要求。
+- 所有运行均完成 owned process-group cleanup，未清理或控制他人进程。连续缩容已累计三次符合新前置条件的独立冷启动 PASS，满足该用例的稳定性验收要求；最后两次运行结束后 GPU 4,5,6,7 均回到每卡 15 MiB、0% 利用率。
 
 ## 8. Immediate Next Steps
 
@@ -963,7 +963,7 @@ kill 用例不得替代 retry 用例；`retry` 只能用 exception 注入验证�
 
 ### 8.2 优先验证门
 
-1. 用 redundant=384 再执行两次独立冷启动 `4 -> 3 -> 2 -> 1`，每轮均在 apply 前断言全部 candidate survivor 为 `unhealthy`，使符合新契约的累计 PASS 达到三次；保留 Mooncake membership-loss、Scheduler self-pause、EPLB begin/end 和 apply waiter 的同轮证据。
+1. 连续 scale-down 的 redundant=384 三次独立冷启动门已完成；后续修改 survivor self-pause、Mooncake membership-loss、EPLB 或 apply 编排时，必须按相同 barrier 和 artifact 要求重新执行 `4 -> 3 -> 2 -> 1`。
 2. Linux CI 运行真实单测：`PYTHONPATH=python python -m pytest test/registered/unit/fault_tolerance/ test/registered/unit/utils/test_subprocess_watchdog.py -q`。
 3. 进程粒度投影：kill 一个 Scheduler，确认 `process_alive_dp_mask` 把整 DP 投影为 `dead`，且 `A*C>1` 时 sibling 一并被 scale-down kill。
 4. 自暂停路径：exception 注入后确认幸存 Scheduler `_engine_paused`、本地 deadline 启动、中心无 pause 命令；`retry`/`scale_down` 在 deadline 前清除 deadline。
