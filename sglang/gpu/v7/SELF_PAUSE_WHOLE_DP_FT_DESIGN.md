@@ -925,7 +925,13 @@ sequenceDiagram
 
 ### 7.3 GPU / 真实多机回归
 
-截至本文更新时，`codex/ft-self-pause-minimal@b7c6f9229` 上**尚无 GPU 运行证据**。第 4.9、4.10 节的功能与部署结论均为设计/限定结论，必须在 GPU/逻辑多节点环境按第 8 节回归后方可标注"已验证"。
+2026-08-10 在单机 GPU 4,5,6,7（运行前后每卡 15 MiB、0% 利用率）对
+`codex/ft-self-pause-minimal@b7c6f9229` 完成两次独立冷启动逻辑四节点回归：
+
+- pause：`pause-rejoin-b7c6f9229-native-first-20260810-r1`，52/52 结构化断言通过。覆盖健康基线、进程 kill、自暂停、`scale_down([3])`、replacement scheduler 存在但控制面仍 `dead`、survivor recovery-drive、三名 survivor 的 `recover ranks [3] done`、第二次 EPLB forward、`disabled`、显式 `recover([3])`、四 rank `healthy`、DP3/DP0 注册精度和四个 owned process group 清理。
+- continue：`continue-rejoin-b7c6f9229-native-first-20260810-r1`，47/47 结构化断言通过。覆盖降级 survivor 服务、replacement scheduler 存在但仍 `dead`、survivor recovery-drive、ready/ProcessUp 与 native-active 汇合后的自动健康路由、四 DP 注册精度和完整清理。
+
+两次 `result.json` 均为 `exit_code=0`、`assertions_pass=true`、源码 clean。该证据确认本设计的单机逻辑多节点 rejoin 时序；它不替代真实跨机网络、heartbeat lease 和节点失联验证，第 4.9、4.10 节超出上述断言的部署结论仍保持限定状态。
 
 ## 8. Immediate Next Steps
 
