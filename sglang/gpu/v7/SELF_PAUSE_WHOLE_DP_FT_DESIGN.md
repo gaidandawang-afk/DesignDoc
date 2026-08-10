@@ -147,7 +147,8 @@ members(dp)  = global ranks [dp*R, (dp+1)*R)
 process_alive_dp_mask[dp] = all(process_alive_mask[r] for r in members(dp))
                             # 一个 DP 只有全部 global Scheduler 成员存活才 process-alive
 disabled_dp_mask[dp]      = (not expected_dp_mask[dp]) and process_alive_dp_mask[dp]
-                            # 派生显示态：已 scale-down 且进程已拉回，不再是存储锁存
+                            # 派生显示态：已 scale-down，且 replacement Scheduler
+                            # 完成 native join/ready 后由 ProcessUp 标记存活
 ```
 
 `pending_recovery` 是"数据面是否 ready"的**反向锁存**，由两个钩子维护：
@@ -159,7 +160,7 @@ disabled_dp_mask[dp]      = (not expected_dp_mask[dp]) and process_alive_dp_mask
 
 ```text
 process_alive_dp_mask[dp] == false                -> dead
-expected_dp_mask[dp] == false                     -> disabled   (进程一就绪即 disabled；pending 只拦 recover，不改显示)
+expected_dp_mask[dp] == false                     -> disabled   (native join/ready 后 ProcessUp 即 disabled；pending 只拦 recover，不改显示)
 expected == true 且 dp in unhealthy_dp_ranks      -> unhealthy
 否则                                              -> healthy
 ```
@@ -171,7 +172,7 @@ expected == true 且 dp in unhealthy_dp_ranks      -> unhealthy
 - **watchdog 是进程事实的 fast path**。heartbeat 首次上报建立 `node_rank -> owned global ranks + control_endpoint` 映射；Node 0 每秒扫描 lease，5 秒未刷新则把该 node 拥有的 global ranks 复用 process-DOWN 路径置为不存活。
 - **heartbeat 永不把 false 位恢复为 true**；只有 rejoin DPC 的显式 `ProcessActiveRanksOutput(active=true)`（ProcessUp）恢复进程位。
 - **Mooncake active 不进入控制面拓扑**。它只驱动两件事：(1) fn2，把恢复完成的 rank 移出 pending；(2) `continue` 策略下参与 route 合成与 auto-recover。它**不能**改写 pause 策略下的 `expected_dp_mask`。
-- **`disabled` 不是存储锁存，而是派生显示态**：`expected=false` 且进程已拉回的 DP 即显示 `disabled`。`recover` 的可恢复判断不看显示态，而是查 `pending_recovery`——目标 DP 任一成员还在 pending 就拒绝（数据面没 ready）。
+- **`disabled` 不是存储锁存，而是派生显示态**：`expected=false` 且 replacement Scheduler 完成 native join/ready、DPC 发出 ProcessUp 后，DP 即显示 `disabled`。当前原生启动屏障使 ProcessUp 晚于 survivor recovery-drive，因此端到端 rejoin 通常不会暴露 `disabled` 且仍 pending 的窗口；`recover` 仍必须独立检查 `pending_recovery`，该防线由状态机单测覆盖。
 - **scale-down 是单阶段**：owner DPC kill 目标 DP 全部 local Scheduler → 等 watchdog 把这些 global rank 标 DOWN → 幸存者安装稀疏 global mask + 强制 EPLB rebalance + 快照到 `last_active_ranks` → 发布 route → 提交 expected。
 - 被 scale-down 移除的 DP 后续退出**不形成新 incident**，因为 `has_incident()` 只检查 expected DP。
 
@@ -362,7 +363,7 @@ flowchart TB
 
 | 消息 | 发送者 | 接收者 | 语义 |
 | --- | --- | --- | --- |
-| `WatchdogHeartbeatOutput(node_rank, ranks, control_endpoint)` | 每节点 DPC watchdog；DPC ready 前的初始注册 | Node 0 TokenizerManager | 首次建立 `node_rank -> owned global ranks` 映射并携带本 DPC control endpoint；后续只刷新 lease；绝不执行 process-UP |
+| `WatchdogHeartbeatOutput(node_rank, ranks, control_endpoint)` | 每节点 DPC watchdog；scheduler ready barrier 后的初始注册 | Node 0 TokenizerManager | 首次建立 `node_rank -> owned global ranks` 映射并携带本 DPC control endpoint；后续只刷新 lease；绝不执行 process-UP |
 | `ProcessActiveRanksOutput(ranks, active)` | 每节点 DPC watchdog；rejoin DPC | Node 0 TokenizerManager | **global Scheduler rank** 粒度的进程存活事实 |
 | `ActiveRanksOutput(status, request_id)` | scheduler / FT manager | TokenizerManager / Node 0 DPC | scheduler 侧是 Mooncake global active mask 投影（数据面观察量）；manager 侧是派生最终 route（带 `request_id` 时要求 DPC ACK） |
 | `FaultToleranceCommandReqInput(request_id, command, target_ranks, active_mask)` | FT manager | Node 0 DPC -> DP scheduler block | DP 级 `retry` / `scale_down`；`active_mask` 仅 scale_down 携带（稀疏 global mask） |
@@ -416,9 +417,9 @@ FT manager -> per-node DPC control socket (PUSH -> DPC PULL control_endpoint)
 - 使用 `stop_event.wait(interval=1s)`（`FT_WATCHDOG_POLL_INTERVAL=1.0`）周期轮询；每轮先 `_check_processes()`，再执行 `on_poll` heartbeat。
 - `_reported` 保证每个 child 的退出回调只执行一次。FT DPC 显式设置 `report_clean_exit=true`、`fail_stop_on_exit=false`：scheduler 无论退出码是否为 0 都上报 global-rank process-DOWN，但 clean exit 不触发默认 SIGQUIT，一个 child 退出后继续监控其余 child。
 - 只要配置了 `on_poll`，即使全部 child 已退出，watchdog 仍持续 heartbeat，直到显式 `stop()` 或 DPC/watchdog 本身退出。
-- DPC ready 前由主线程用 `send_to_tokenizer` PUSH 发送一次初始 `WatchdogHeartbeatOutput`（携带 `control_endpoint`）。周期 heartbeat 与本地 process-DOWN 使用 watchdog 线程懒建并独占的另一只持久 PUSH（`SNDHWM=1`、`IMMEDIATE`、`SNDTIMEO=FT_WATCHDOG_SEND_TIMEOUT_MS=1000`）；heartbeat 用 `NOBLOCK` 允许丢弃单次刷新，process-DOWN 用限时阻塞发送并先于随后 heartbeat 入队。
+- DPC 主线程同步等待所有本地 Scheduler 完成初始化 pipe；该 ready barrier 返回后，先用 `send_to_tokenizer` PUSH 发送一次初始 `WatchdogHeartbeatOutput`（携带 `control_endpoint`），再启动周期 watchdog。周期 heartbeat 与本地 process-DOWN 使用 watchdog 线程懒建并独占的另一只持久 PUSH（`SNDHWM=1`、`IMMEDIATE`、`SNDTIMEO=FT_WATCHDOG_SEND_TIMEOUT_MS=1000`）；heartbeat 用 `NOBLOCK` 允许丢弃单次刷新，process-DOWN 用限时阻塞发送并先于随后 heartbeat 入队。
 - Node 0 首次收到 heartbeat 时固定记录 `node_rank -> sorted(owned global ranks)` 和接收端 monotonic 时间，后续同节点 heartbeat **只刷新时间，不更新 ranks**；同时 TokenizerManager 按 `control_endpoint` 建立/更新该 node 的 DPC control PUSH socket。每秒扫描一次，5 秒（`WATCHDOG_LEASE_TIMEOUT_SEC=5`）未刷新则合并所有过期 node 的 global ranks，复用一次 `ProcessActiveRanksOutput(active=false)` 处理路径。
-- heartbeat 本身永远不把 process 标为 true；late heartbeat 只重新注册 lease。process-UP 仍只能由 rejoin DPC 的 ready 路径显式上报。
+- heartbeat 本身永远不把 process 标为 true；late heartbeat 只重新注册 lease。process-UP 仍只能由 rejoin DPC 在 scheduler ready barrier 返回后显式上报。
 
 成功自暂停后的超时退出**不是** `SoftWatchdog`/`HardWatchdog`/`SubprocessWatchdog` 的新分支，也不是 FT manager 的 `asyncio.TimerHandle`。它是每个 Scheduler event loop 检查的 monotonic deadline：无需新增线程或 IPC，每个节点都能独立通知自己的 node main。`SubprocessWatchdog` 仍只负责 child 存活轮询和 heartbeat；`HardWatchdog`/`SoftWatchdog` 仍负责既有 forward-progress 监控。
 
@@ -516,15 +517,16 @@ expected_dp_mask[dp] = false
 pause 策略下，DP 在 rejoin 后最终恢复为 `healthy` 并重新接收请求，需要按顺序满足：
 
 ```text
-1. 整 node 进程组重拉，ProcessUp -> process_alive_mask 恢复；进程一就绪即显示 disabled
-   （此时数据面尚未 ready，members(dp) 仍在 pending_recovery）
-2. 原生 survivor forward -> Mooncake try_recover + 原生 EPLB/第二次 forward
+1. 整 node 进程组重拉；replacement Scheduler 进入 native join，控制面仍显示 dead
+2. 显式 survivor forward -> Mooncake try_recover，解除 replacement join；再执行原生 EPLB/第二次 forward
 3. native active 翻 true -> fn2 把 members(dp) 移出 pending_recovery（数据面 ready）
-4. recover(dp) -> 校验 members(dp) ∩ pending_recovery == ∅ -> expected_dp_mask[dp]=true
+4. replacement Scheduler 初始化完成 -> DPC ready barrier 返回 -> initial heartbeat + ProcessUp
+   -> process_alive_mask 恢复；因 expected=false，显示 disabled
+5. recover(dp) -> 校验 members(dp) ∩ pending_recovery == ∅ -> expected_dp_mask[dp]=true
    -> publish DPC route -> 状态 healthy
 ```
 
-`recover` 不发送 Scheduler 命令、不重排专家、不做 topology expansion；所有数据面扩容必须在 `recover` 前由原生 rejoin forward 完成。continue 策略下第 4 步由 fn2 自动完成，无需 `recover`（见 4.5）。
+`recover` 不发送 Scheduler 命令、不重排专家、不做 topology expansion；所有数据面扩容必须在 `recover` 前由原生 rejoin forward 完成。continue 策略下最后一步由 fn2/ProcessUp 状态汇合后自动完成，无需 `recover`（见 4.5）。
 
 ### 4.2 `pause` 策略
 
@@ -575,7 +577,7 @@ watchdog 先更新 `process_alive_mask`，中心据此关闭请求入口；幸�
 
 只用一个 DPC control endpoint 发送 kill 请求；没有 prepare/rebalance/resume 三阶段命令。
 
-外部可以先 kill 任意 Scheduler，再对该失活 global rank 所属 DP 调用 `scale_down`；`scale_down` 会继续 kill 该 DP 的其余 sibling。完成后该 DP 状态保持 `dead`（不会自动变 `disabled`，要等原生 rejoin 数据面恢复）。
+外部可以先 kill 任意 Scheduler，再对该失活 global rank 所属 DP 调用 `scale_down`；`scale_down` 会继续 kill 该 DP 的其余 sibling。完成后该 DP 状态保持 `dead`；完整节点重拉后仍保持 `dead`，直到 survivor forward 完成原生数据面恢复、replacement Scheduler 穿过 ready barrier 并由 DPC 上报 ProcessUp，才显示 `disabled`。
 
 ### 4.5 `continue` 策略
 
@@ -844,14 +846,15 @@ sequenceDiagram
 
     EXT-xOLD: recovery 阶段停止完整非0节点进程组
     EXT->>NEW: 以 elastic_ep_rejoin(recover 模式) 启动同一 node rank
-    NEW->>ST: WatchdogHeartbeatOutput(node_rank, global ranks, control_ep)
-    NEW->>ST: ProcessActiveRanksOutput(global ranks, true)
-    Note over NEW,ST: process_alive 恢复 -> 显示 disabled；members 仍在 pending_recovery
     NEW->>MC: replacement ranks enter join_group
+    Note over NEW,ST: scheduler 子进程存在，但 ready barrier 未返回；控制面仍显示 dead
     SUR->>MC: one explicitly routed survivor forward calls try_recover_ranks
     MC-->>NEW: join completes + 原生 EPLB/第二次 forward
     SUR->>ST: ActiveRanksOutput(global active mask)
     ST->>ST: fn2 把 members 移出 pending_recovery（数据面 ready）
+    NEW->>ST: WatchdogHeartbeatOutput(node_rank, global ranks, control_ep)
+    NEW->>ST: ProcessActiveRanksOutput(global ranks, true)
+    Note over NEW,ST: process_alive 恢复；pause 下 expected=false -> 显示 disabled
     alt pause 策略
         API->>ST: POST apply recover([dp])  (校验 members ∩ pending = ∅)
         ST->>ST: expected_dp_mask[dp]=true
@@ -868,11 +871,11 @@ sequenceDiagram
 约束：
 
 - 恢复单位是完整节点进程组，不是单独 spawn 一个 scheduler。
-- rejoin DPC 在 ready 前先发 initial heartbeat，scheduler ready 后再发 ProcessUp；两者都不代表 Mooncake rank 已完成 join。
-- replacement scheduler 进入 `join_group` 后仍可能等待 survivor 推理推进恢复；测试必须等待 replacement ranks 确实进入 Mooncake join，再发 recovery-drive。
+- rejoin DPC 同步等待 replacement Scheduler 初始化；Scheduler 的 native `join_group` 完成后 ready barrier 才返回，随后 DPC 依次发送 initial heartbeat 和 ProcessUp。因此两条控制面消息都晚于本轮 survivor recovery-drive。
+- replacement scheduler 进入 `join_group` 后等待 survivor 推理推进恢复；测试先确认 replacement scheduler 进程存在且控制面仍为 `dead`，再向已确认存活的 survivor 发送 bounded recovery-drive，不能先等待 ProcessUp。
 - recovery-drive 必须显式路由到已确认存活的 survivor DP；不能用普通负载均衡请求碰运气。
 - ProcessUp 本身不开放 route；`recover` 不发送 scheduler resume、不重排专家。
-- 若在 replacement ranks 尚未就绪前反复发 survivor 请求，Mooncake 可能先确认新的 rank fault；`pause` 策略会让幸存者自暂停，之后 HTTP gate 持续返回 503。发生这种状态时应先检查 `/status` 和日志，必要时 apply `retry` 恢复 survivors，再执行一次 recovery-drive，不能盲目循环 503。
+- recovery-drive 必须有界并保存每次响应；若 survivor 因新的 membership fault 自暂停、HTTP gate 持续返回 503，应保存 `/status` 和日志并判定本轮失败，不能把无界重试当作恢复。
 
 ## 6. 设计边界（不采用的方案）
 
@@ -902,7 +905,7 @@ sequenceDiagram
 3. HTTP：inactive 显式路由为 400，pause/no-route admission 为 503。
 4. 路由：非显式请求只进入 effective active DP。
 5. 精度：确定性 prompt 的输出 token IDs 与故障前一致。
-6. rejoin：replacement rank 加入、Mooncake runtime recover、控制面授权（`recover`）和最终 DP 路由分别取证；scale-down 目标必须增加 `dead -> disabled -> recover -> healthy` 中间断言。
+6. rejoin：replacement scheduler 进程出现但仍为 `dead`、survivor recovery-drive、Mooncake runtime recover、ready/ProcessUp 后的 `disabled`、控制面授权（`recover`）和最终 DP 路由分别取证；scale-down 目标必须断言 `dead -> native recovery -> disabled -> recover -> healthy`。
 7. 结果证据：不能只 grep 附件脚本里的 `CASE_RESULT`；必须同时确认 `result.json.exit_code == 0` 和 `stdout.txt` 的运行期 PASS。
 
 用例结论必须严格受实际断言范围约束：status-only 用例不能宣称验证了精度；只检查一个 survivor 的用例不能宣称所有 survivor 均可用；进程存活不能单独证明其专家一定参与了计算。
@@ -934,7 +937,7 @@ sequenceDiagram
 2. kill 一个 Scheduler -> `dead` -> `scale_down`，目标整个 DP 退出。
 3. `A*C>1` 时 kill 一个 sibling，`scale_down` 后同 DP 全部 sibling 退出。
 4. `4 -> 3` 后 exception `retry`，始终保留三实例且被移除 DP 仍不可路由。
-5. `scale_down` 后按完整 nnode rejoin：pause 走 `disabled -> recover -> healthy`（recover 前须数据面 ready），continue 由 fn2 auto-recover。
+5. `scale_down` 后按完整 nnode rejoin：replacement 等待 native join 时保持 `dead`；survivor recovery-drive 后，pause 走 `disabled -> recover -> healthy`，continue 由 fn2/ProcessUp 汇合后 auto-recover。
 6. `continue` kill 保留原生 EPLB、第二次 forward 和 route 行为，且不暂停 admission。
 7. watchdog child exit、heartbeat lease timeout、ProcessUp 和进程粒度投影单测（已在 7.2 覆盖，需 Linux CI 实跑）。
 
@@ -947,7 +950,7 @@ kill 用例不得替代 retry 用例；`retry` 只能用 exception 注入验证�
 3. 自暂停路径：exception 注入后确认幸存 Scheduler `_engine_paused`、本地 deadline 启动、中心无 pause 命令；`retry`/`scale_down` 在 deadline 前清除 deadline。
 4. 成功自暂停后无人处置：逻辑多节点与真实多机上，每个节点在 `fault_tolerance_pause_timeout` 后由本地 Scheduler 通知 node main，所有节点本地进程树退出；deadline 前 retry/scale-down 不误退出。
 5. scale-down 单阶段：确认 shutdown 无独立 ACK、幸存者强制 rebalance 且快照 `last_active_ranks`、route 发布与 expected 提交顺序正确。
-6. rejoin 两种策略路径：pause 走 `disabled -> recover -> healthy`（recover 前须 `members ∩ pending = ∅`），continue 由 fn2 在 native-active 后 auto-recover；ProcessUp 单独不开放 route。
+6. rejoin 两种策略路径：先证明 replacement 进程存在但控制面仍 `dead`，再由 survivor forward 完成 native join；pause 随后走 `disabled -> recover -> healthy`（recover 前须 `members ∩ pending = ∅`），continue 由 fn2/ProcessUp 状态汇合后 auto-recover；ProcessUp 单独不开放 route。
 7. Mooncake dispatcher `first_execution` 复位：rank mask 变化后首个 dispatch 重新握手，不沿用旧 handle。
 8. `A*C>1` 只验证已承诺边界：整 DP 退出/重拉可推进；leader 死亡而 sibling 残存必须明确判为不支持，不能误报恢复成功。
 
@@ -974,9 +977,9 @@ kill 用例不得替代 retry 用例；`retry` 只能用 exception 注入验证�
 
 ### 9.3 整节点静态故障沿用 heartbeat lease
 
-每个 FT DPC 在 ready 前发送初始 heartbeat，之后 watchdog 每秒刷新；Node 0 维护接收端 monotonic 时间，5 秒过期后按首次注册的 `node->global ranks` 映射复用 process-DOWN。仍需验证的风险：
+每个 FT DPC 在本地 Scheduler ready barrier 返回后发送初始 heartbeat，之后 watchdog 每秒刷新；Node 0 维护接收端 monotonic 时间，5 秒过期后按首次注册的 `node->global ranks` 映射复用 process-DOWN。rejoin 时 replacement Scheduler 可在 native join 中等待 survivor forward，此阶段 Node 0 尚未收到该节点的新 heartbeat。仍需验证的风险：
 
-- 初始 heartbeat 没有接收 ACK；不能把"集群尚未完成启动时节点立刻死亡"宣称为严格已覆盖。
+- 初始 heartbeat 没有接收 ACK，且发送晚于 Scheduler 初始化；不能把"集群尚未完成启动或 rejoin 尚在 native join 时节点立刻死亡"宣称为严格已覆盖。
 - 5 秒 timeout 是固定实现值，真实网络抖动下可能误判；当前没有 generation 或租约协商。
 - heartbeat 首次注册后 ranks 不再更新；若 DPC 在两次 heartbeat 之间改变 owned ranks（本轮不发生），lease 映射会是旧值。
 - heartbeat endpoint、DPC control endpoint、Mooncake transport 和真实跨机故障尚无本轮 GPU/多机证据。
