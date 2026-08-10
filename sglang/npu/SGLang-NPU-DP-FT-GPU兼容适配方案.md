@@ -330,13 +330,13 @@ flowchart TD
     classDef gpu fill:#eef3fb,stroke:#4a78c2,color:#1a1a1a
     classDef npu fill:#fff4d6,stroke:#d99a06,color:#1a1a1a,stroke-dasharray:5 4
 
-    R([故障时刻的 in-flight 请求])
-    R --> H{请求所在 DP}
-    H -->|健康 DP, exception| HG[GPU: discard 503<br/>retry/scale_down 恢复后继续]:::gpu
-    H -->|健康 DP, exception| HN[★4 NPU: retract 回队重算<br/>重 prefill 续推<br/>客户端仅停顿, 无重复 token]:::npu
-    H -->|故障 DP（进程已死/scale_down）| FD{已发出 token?}
-    FD -->|否| RP[★7 重推: 原 GenerateReqInput<br/>发往健康 DP<br/>复用 rid · 存活检查 · 重试上限<br/>客户端拿到完整 response]:::npu
-    FD -->|是（已流式输出）| K5[★7 503 终态<br/>重推会产生重复输出, 禁止]:::npu
+    R(["故障时刻的 in-flight 请求"])
+    R --> H{"请求所在 DP"}
+    H -->|"健康 DP, exception"| HG["GPU: discard 503<br/>retry/scale_down 恢复后继续"]:::gpu
+    H -->|"健康 DP, exception"| HN["★4 NPU: retract 回队重算<br/>重 prefill 续推<br/>客户端仅停顿, 无重复 token"]:::npu
+    H -->|"故障 DP (进程已死 / scale_down)"| FD{"已发出 token?"}
+    FD -->|"否"| RP["★7 重推: 原 GenerateReqInput<br/>发往健康 DP<br/>复用 rid · 存活检查 · 重试上限<br/>客户端拿到完整 response"]:::npu
+    FD -->|"是 (已流式输出)"| K5["★7 503 终态<br/>重推会产生重复输出, 禁止"]:::npu
 ```
 
 ### 6.3 时序细节
@@ -358,7 +358,8 @@ sequenceDiagram
     API->>CP: "apply: retry / scale_down"
     rect rgb(255, 244, 214)
     Note over SCH,DEV: "★1~★5 恢复事务（GPU: 全部跳过, batch 原地保留）"
-    CP->>SCH: "retry / scale_down — v7 现有命令; scale_down 先由 DPC kill 目标 DP"
+    CP->>SCH: "retry / scale_down",
+    Note over SCH: "scale_down 先由 DPC kill 目标 DP 的本地 Scheduler"
     SCH->>DEV: "★1 stop_device + restart_device（连续, 各幸存 rank 同拍）"
     SCH->>SCH: "★2 reinit_process_group（集体=天然 barrier）"
     Note over SCH: "★3 此后 MLP sync 走独立容错 gloo PG（C1 已重建）"
