@@ -933,6 +933,13 @@ sequenceDiagram
 
 两次 `result.json` 均为 `exit_code=0`、`assertions_pass=true`、源码 clean。该证据确认本设计的单机逻辑多节点 rejoin 时序；它不替代真实跨机网络、heartbeat lease 和节点失联验证，第 4.9、4.10 节超出上述断言的部署结论仍保持限定状态。
 
+同日继续在 exact `b7c6f9229` 上执行其余 13 个 active contract。12 个用例通过，连同上述两条 rejoin，当前总计 **14/15 active contracts 通过、成功用例 428/428 结构化断言通过**。唯一失败是 `fault-kill-pause-continuous-scale-down`：
+
+- `fault-kill-pause-continuous-scale-down-b7c6f9229-gpu4567-20260810-r1` 在共享 GPU 窗口失败；`r2` 在 GPU 4,5,6,7 全部为 15 MiB、0% 的空闲窗口重复失败。
+- 两次都成功完成 `4 -> 3 -> 2`，第三次 kill 后状态为 `0=healthy,1=dead,2=dead,3=dead`、只剩 DP0 Scheduler，随后 `scale_down([3])` 在 180 秒超时。
+- DP0 日志均停在 `[EPLBManager] rebalance start`，没有 `rebalance end`；此前 Mooncake 报 `BatchID leaked due to freeBatchID failure`。FT HTTP 最终记录 `fault tolerance apply scale_down failed`。
+- 两次失败均完成 owned process-group cleanup，源码 clean。空闲窗口复现排除了共享 GPU 压力是主因；这是当前 HEAD 的稳定 FT correctness failure，不能沿用旧版本的 continuous-scale-down PASS 结论。
+
 ## 8. Immediate Next Steps
 
 本节是后续执行进度的唯一任务源；remote-agent suite 只维护脚本和运行命令，验收边界与运行结论回写本文。判断标准是缩小拓扑是否保留了待验证机制和断言。
@@ -951,14 +958,15 @@ kill 用例不得替代 retry 用例；`retry` 只能用 exception 注入验证�
 
 ### 8.2 优先验证门
 
-1. Linux CI 运行真实单测：`PYTHONPATH=python python -m pytest test/registered/unit/fault_tolerance/ test/registered/unit/utils/test_subprocess_watchdog.py -q`。
-2. 进程粒度投影：kill 一个 Scheduler，确认 `process_alive_dp_mask` 把整 DP 投影为 `dead`，且 `A*C>1` 时 sibling 一并被 scale-down kill。
-3. 自暂停路径：exception 注入后确认幸存 Scheduler `_engine_paused`、本地 deadline 启动、中心无 pause 命令；`retry`/`scale_down` 在 deadline 前清除 deadline。
-4. 成功自暂停后无人处置：逻辑多节点与真实多机上，每个节点在 `fault_tolerance_pause_timeout` 后由本地 Scheduler 通知 node main，所有节点本地进程树退出；deadline 前 retry/scale-down 不误退出。
-5. scale-down 单阶段：确认 shutdown 无独立 ACK、幸存者强制 rebalance 且快照 `last_active_ranks`、route 发布与 expected 提交顺序正确。
-6. rejoin 两种策略路径：先证明 replacement 进程存在但控制面仍 `dead`，再由 survivor forward 完成 native join；pause 随后走 `disabled -> recover -> healthy`（recover 前须 `members ∩ pending = ∅`），continue 由 fn2/ProcessUp 状态汇合后 auto-recover；ProcessUp 单独不开放 route。
-7. Mooncake dispatcher `first_execution` 复位：rank mask 变化后首个 dispatch 重新握手，不沿用旧 handle。
-8. `A*C>1` 只验证已承诺边界：整 DP 退出/重拉可推进；leader 死亡而 sibling 残存必须明确判为不支持，不能误报恢复成功。
+1. 定位并修复连续 scale-down 到单 DP 的稳定 hang：第三轮 `scale_down([3])` 中 DP0 进入 EPLB rebalance 后不返回；必须保留 Mooncake BatchID 泄漏、active/last-active mask、rebalance collective 和 apply waiter 的同轮证据，并用独立冷启动复验。
+2. Linux CI 运行真实单测：`PYTHONPATH=python python -m pytest test/registered/unit/fault_tolerance/ test/registered/unit/utils/test_subprocess_watchdog.py -q`。
+3. 进程粒度投影：kill 一个 Scheduler，确认 `process_alive_dp_mask` 把整 DP 投影为 `dead`，且 `A*C>1` 时 sibling 一并被 scale-down kill。
+4. 自暂停路径：exception 注入后确认幸存 Scheduler `_engine_paused`、本地 deadline 启动、中心无 pause 命令；`retry`/`scale_down` 在 deadline 前清除 deadline。
+5. 成功自暂停后无人处置：逻辑多节点与真实多机上，每个节点在 `fault_tolerance_pause_timeout` 后由本地 Scheduler 通知 node main，所有节点本地进程树退出；deadline 前 retry/scale-down 不误退出。
+6. scale-down 单阶段：确认 shutdown 无独立 ACK、幸存者强制 rebalance 且快照 `last_active_ranks`、route 发布与 expected 提交顺序正确。
+7. rejoin 两种策略路径：先证明 replacement 进程存在但控制面仍 `dead`，再由 survivor forward 完成 native join；pause 随后走 `disabled -> recover -> healthy`（recover 前须 `members ∩ pending = ∅`），continue 由 fn2/ProcessUp 状态汇合后 auto-recover；ProcessUp 单独不开放 route。
+8. Mooncake dispatcher `first_execution` 复位：rank mask 变化后首个 dispatch 重新握手，不沿用旧 handle。
+9. `A*C>1` 只验证已承诺边界：整 DP 退出/重拉可推进；leader 死亡而 sibling 残存必须明确判为不支持，不能误报恢复成功。
 
 ### 8.3 补充回归场景
 
