@@ -386,3 +386,122 @@ sequenceDiagram
 | ★5 | 恢复事务·阶段 4 前 | 跳过 | 图有效性检查，必要时重捕 | 5 |
 | ★6 | rejoin 进程 device init | 正常 init | `stop_device` + `restart_device` 连做 | 1 |
 | ★7 | process-DOWN / scale_down 之后 | 原生：挂起（可选启用） | 未出 token → 重推；已出 token → 503 | 7 |
+
+---
+
+## 7. 部署视图：每节点进程组件与通信
+
+> 本视图与 v7 指南「§3.5 多节点进程布局」和「§3.6 消息模型」保持一致；只补充 NPU 侧**设备级别的 NCCL/HCCL 通道**。组件含义：
+>
+> - **node main（主进程）**：HTTP Server + TokenizerManager + FaultToleranceManager。
+> - **DPC（DataParallelController）**：每逻辑节点一个；Node 0 的 DPC 做全局请求路由，所有 DPC（含非 0 节点）在 FT 模式下都跑自己的 event loop 并持有 FT control endpoint（接收 `FaultToleranceDPCShutdownReqInput` kill 请求）。
+> - **local polling watchdog**：每个 DPC 一个 `SubprocessWatchdog`，轮询本地 Scheduler children 存活并上报 heartbeat / process-DOWN（global Scheduler rank 粒度）。
+> - **Scheduler**：每个 DP attention/EP 拓扑一个，是 node main 的孙进程（DPC 的 child）；本地自暂停由 Scheduler 在 forward 异常边界自行完成。
+
+### 7.1 单节点组件图
+
+```mermaid
+flowchart TD
+    classDef main fill:#eef3fb,stroke:#4a78c2,color:#1a1a1a
+    classDef dpc  fill:#e6f4e6,stroke:#2e7d32,color:#1a1a1a
+    classDef sch  fill:#fef7e0,stroke:#d99a06,color:#1a1a1a
+    classDef coll fill:#fbe9e7,stroke:#c62828,color:#1a1a1a
+
+    subgraph MAIN["node main（主进程）"]
+        HTTP["HTTP Server"]:::main
+        TM["TokenizerManager"]:::main
+        FTM["FaultToleranceManager"]:::main
+        HTTP --> TM
+        TM --- FTM
+    end
+
+    DPC["DataParallelController (DPC)<br/>FT control endpoint"]:::dpc
+    WDG["SubprocessWatchdog<br/>local polling watchdog"]:::dpc
+
+    MAIN -->|"spawn"| DPC
+    DPC -->|"spawn"| SCH0["Scheduler (DP state)<br/>含 _engine_paused 本地自暂停"]:::sch
+    DPC -->|"spawn"| SCH1["Scheduler ..."]:::sch
+    DPC -->|"spawn"| SCHN["Scheduler ..."]:::sch
+    DPC -->|"spawn / 监控"| WDG
+    WDG --- SCH0
+    WDG --- SCH1
+    WDG --- SCHN
+
+    %% 集合通信 / 数据面 (NCCL GPU · HCCL NPU)
+    COLL["集合通信世界进程组 (NCCL / HCCL)<br/>TP·DP·EP 集体 · forward MLP broadcast"]:::coll
+    SCH0 --- COLL
+    SCH1 --- COLL
+    SCHN --- COLL
+```
+
+进程树：`node main → DPC → (watchdog + Scheduler children)`。Scheduler 之间共享 NCCL/HCCL 世界进程组做 forward 集体。
+
+### 7.2 单节点组件间通信通道
+
+| 通道 | 传输 | 连接哪两个组件 | 用途 |
+| --- | --- | --- | --- |
+| HTTP | TCP / HTTP(S) | 客户端 → Node 0 HTTP Server | `/generate`、`/fault_tolerance/apply|status`、`/health` 等入口 |
+| ZMQ（`send_to_scheduler`，Node 0 DPC 的 `scheduler_input_ipc_name`） | ZMQ PUSH/PULL | TokenizerManager ⇄ Node 0 DPC | 下发请求 / FT 命令（`FaultToleranceCommandReqInput`）+ 回流（`FaultToleranceCommandReqOutput` 等） |
+| ZMQ（per-node DPC control socket） | ZMQ PUSH/PULL | FT manager ⇄ 本节点 DPC control endpoint | `FaultToleranceDPCShutdownReqInput`（kill 目标 DP 本地 Scheduler）+ `ActiveRanksUpdateReqOutput` 等 |
+| Watchdog heartbeat / ProcessDown | ZMQ PUSH（持久，`SNDHWM=1`） | 本节点 watchdog ⇄ Node 0 TokenizerManager | `WatchdogHeartbeatOutput`、`ProcessActiveRanksOutput(global ranks, active)` |
+| Scheduler ↔ TokenizerManager 回流 | ZMQ（DP roller / dist server IPC） | 各 Scheduler ⇄ Node 0 TokenizerManager | `ActiveRanksOutput`（Mooncake active mask 投影）、`FaultToleranceRankFaultOutput` |
+| 进程树 spawn / kill | OS process（`proc.kill()`） | node main ⇄ DPC ⇄ Scheduler | spawn Scheduler；scale_down 由 DPC kill 目标 DP 本地 Scheduler |
+| DP 内调度器间多路复用 IPC | ZMQ IPC（ipc/ab + dist ipc names） | Scheduler ⇄ Scheduler（DP 内） | forward batch 广播、DP attention/EP 数据面 |
+| **集合通信（forward）** | **NCCL（GPU）/ HCCL（NPU）** | 所有 Scheduler（世界进程组） | TP·DP·EP 集体、DP attention、EP（MoE）占比等 |
+| **MLP sync / 恢复期集体** | **gloo（GPU：mooncake-cpu group） / NPU：独立容错 gloo PG（C1 重建）** | 跨 DP Scheduler | forward 的 MLP sync、恢复事务阶段 2 重建后的集体（适配点 4） |
+| Mooncake store / lease | TCP / shared store | 各节点 DPC/Scheduler ⇄ Mooncake | elastic EP membership、heartbeat lease |
+
+### 7.3 多节点部署视图（含 NPU 集合通信）
+
+多节点下：非 0 节点 DPC **不**持有全局路由，只监听自己的 FT control endpoint；全局请求路由只在 Node 0 的 DPC。各节点 watchdog 把 `heartbeat(node, global ranks, control_ep)` 上报 Node 0；每个节点的 DPC 都接受 Node 0 下发的 `FaultToleranceDPCShutdownReqInput`。
+
+```mermaid
+flowchart TB
+    classDef nd fill:#eef3fb,stroke:#4a78c2,color:#1a1a1a
+    classDef coll fill:#fbe9e7,stroke:#c62828,color:#1a1a1a
+
+    subgraph N0["Node 0"]
+        HTTPN0["HTTP + TokenizerManager + FTM"]:::nd
+        DPCN0["DPC 0 · 全局请求路由 + FT control"]:::nd
+        WN0["local watchdog"]:::nd
+        SN0["Scheduler children"]:::nd
+        HTTPN0 --> DPCN0 --> SN0
+        WN0 --- SN0
+    end
+
+    subgraph N1["Node 1"]
+        DPCN1["DPC 1 · 仅 FT control (无全局路由)"]:::nd
+        WN1["local watchdog"]:::nd
+        SN1["Scheduler children"]:::nd
+        DPCN1 --> SN1
+        WN1 --- SN1
+    end
+
+    subgraph NX["Node ..."]
+        DPCNX["DPC ... · 仅 FT control"]:::nd
+        WNX["local watchdog"]:::nd
+        SNX["Scheduler children"]:::nd
+        DPCNX --> SNX
+        WNX --- SNX
+    end
+
+    WN0 -->|"heartbeat(node0, ranks, control_ep) / process DOWN"| HTTPN0
+    WN1 -->|"heartbeat(node1, ranks, control_ep) / process DOWN"| HTTPN0
+    WNX -->|"heartbeat(node..., ranks, control_ep) / process DOWN"| HTTPN0
+    HTTPN0 -->|"effective ActiveRanksOutput(route)"| DPCN0
+    HTTPN0 -->|"DPC shutdown(control_ep)"| DPCN1
+    HTTPN0 -->|"DPC shutdown(control_ep)"| DPCNX
+
+    %% 跨节点集合通信
+    COLLN["NCCL/HCCL 世界进程组 (跨节点) · TP·DP·EP forward 集体"]:::coll
+    SN0 --- COLLN
+    SN1 --- COLLN
+    SNX --- COLLN
+```
+
+### 7.4 与 NPU 适配点的对应
+
+- DPC 的 **FT control endpoint** 是 scale_down 的 kill 通道（v7 指南 4.4 step5）；NPU 的 `stop_device/restart_device` 不在 DPC 层，而是 Scheduler 在恢复事务阶段 1 调用 `FtDeviceOps`（适配点 1）。
+- **MLP sync / 恢复期集体**：GPU 用 mooncake-cpu group（dead-rank-safe）；NPU 用**独立容错 gloo PG**（适配点 4，C1 重建）。这是两设备在通信通道上唯一分叉点。
+- **forward 世界进程组**：GPU 用 NCCL，NPU 用 HCCL（DeepEP-Ascend / MC2）；恢复时 NPU 依赖 PG 重建 + 图有效性确认（适配点 5）。
+- 各节点 watchdog 上报的 rank 均为 **global Scheduler rank** 粒度（v7 规范 §3），控制面据 `process_alive_mask` 投影整 DP 存活（适配点 3 的进程事实源）。
