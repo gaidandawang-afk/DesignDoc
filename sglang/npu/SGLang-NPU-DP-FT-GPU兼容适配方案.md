@@ -297,30 +297,30 @@ flowchart TD
     classDef base fill:#eef3fb,stroke:#4a78c2,color:#1a1a1a
     classDef npu fill:#fff4d6,stroke:#d99a06,color:#1a1a1a,stroke-dasharray:5 4
 
-    subgraph SPINE [共用控制面主干 — GPU/NPU 一套代码]
-        F([故障发生<br/>进程退出 · recoverable exception · 设备 hang]):::base
-        DET[检测与隔离<br/>watchdog DOWN / lease 超时 / 异常上报<br/>关闭故障 DP 路由 · admission 503]:::base
-        SELF[Scheduler 自暂停<br/>(a) exception 直接自暂停<br/>(b) membership 下降沿抛异常自暂停<br/>置 _engine_paused · 启动本地 fail-stop deadline]:::base
-        DEC{上层 apply<br/>retry / scale_down}:::base
-        REC[恢复事务<br/>retry: maskless 恢复<br/>scale_down: 整 DP kill + 强制 EPLB]:::base
-        RUN[恢复推理<br/>_engine_paused=False]:::base
+    subgraph SPINE ["共用控制面主干 — GPU/NPU 一套代码"]
+        F(["故障发生 — 进程退出 · recoverable exception · 设备 hang"]):::base
+        DET["检测与隔离 — watchdog DOWN / lease 超时 / 异常上报 — 关闭故障 DP 路由 · admission 503"]:::base
+        SELF["Scheduler 自暂停<br/>(a) exception 直接自暂停<br/>(b) membership 下降沿抛异常自暂停<br/>置 _engine_paused · 启动本地 fail-stop deadline"]:::base
+        DEC{"上层 apply<br/>retry / scale_down"}:::base
+        REC["恢复事务<br/>retry: maskless 恢复<br/>scale_down: 整 DP kill + 强制 EPLB"]:::base
+        RUN["恢复推理<br/>_engine_paused=False"]:::base
         F --> DET --> SELF --> DEC --> REC --> RUN
     end
 
-    subgraph NPULANE [NPU 插入链 — GPU 上全部 no-op, 主干直通]
-        N0[★0 设备 hang → forward 检查点<br/>转受控异常, 走既有 exception 族]:::npu
-        N1[★1 恢复事务阶段1<br/>stop_device + restart_device 连续<br/>各幸存 rank 同拍执行]:::npu
-        N2[★2 恢复事务阶段2<br/>reinit_process_group<br/>集体 = 天然 barrier]:::npu
-        N3[★3 恢复事务阶段2<br/>独立容错 gloo PG 可用<br/>C1 通道]:::npu
-        N4[★4 恢复事务阶段3<br/>retract batch 回 waiting queue<br/>释放 KV · 保留 output_ids]:::npu
-        N5[★5 恢复事务阶段4 前<br/>图有效性检查<br/>必要时重捕]:::npu
+    subgraph NPULANE ["NPU 插入链 — GPU 上全部 no-op, 主干直通"]
+        N0["★0 设备 hang → forward 检查点<br/>转受控异常, 走既有 exception 族"]:::npu
+        N1["★1 恢复事务阶段1<br/>stop_device + restart_device 连续<br/>各幸存 rank 同拍执行"]:::npu
+        N2["★2 恢复事务阶段2<br/>reinit_process_group<br/>集体 = 天然 barrier"]:::npu
+        N3["★3 恢复事务阶段2<br/>独立容错 gloo PG 可用<br/>C1 通道"]:::npu
+        N4["★4 恢复事务阶段3<br/>retract batch 回 waiting queue<br/>释放 KV · 保留 output_ids"]:::npu
+        N5["★5 恢复事务阶段4 前<br/>图有效性检查<br/>必要时重捕"]:::npu
         N0 --> DET
         N1 --> N2 --> N3 --> N4 --> N5
     end
 
     F -.- N0
-    REC -. GPU: 直通 RUN<br/>NPU: 恢复事务 .-> N1
-    N5 -. 事务完成 → 清 _engine_paused .-> RUN
+    REC -. "GPU: 直通 RUN<br/>NPU: 恢复事务" .-> N1
+    N5 -. "事务完成 → 清 _engine_paused" .-> RUN
 ```
 
 ### 6.2 in-flight 请求分支（对应适配点 2 / 7）
@@ -344,33 +344,33 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     autonumber
-    participant FLT as 故障源
-    participant CP as Node0控制面(TM+FTMgr)
-    participant SCH as 幸存 schedulers
-    participant DEV as 设备hook(FtDeviceOps)
-    participant API as 上层/客户端
+    participant FLT as "故障源"
+    participant CP as "Node0控制面(TM+FTMgr)"
+    participant SCH as "幸存 schedulers"
+    participant DEV as "设备hook(FtDeviceOps)"
+    participant API as "上层/客户端"
 
-    FLT->>SCH: forward 抛异常 / membership 下降沿
-    Note over FLT,SCH: ★0 NPU 设备 hang 在 forward 检查点转为受控异常（GPU 无此步）
-    SCH->>SCH: _engine_paused=True · 启动本地 fail-stop deadline
-    SCH->>CP: FaultToleranceRankFaultOutput（单向上报, 无 ACK）
-    CP->>CP: 记 unhealthy · 关闭路由 · admission 503
-    API->>CP: apply: retry / scale_down
+    FLT->>SCH: "forward 抛异常 / membership 下降沿"
+    Note over FLT,SCH: "★0 NPU 设备 hang 在 forward 检查点转为受控异常（GPU 无此步）"
+    SCH->>SCH: "_engine_paused=True · 启动本地 fail-stop deadline"
+    SCH->>CP: "FaultToleranceRankFaultOutput（单向上报, 无 ACK）"
+    CP->>CP: "记 unhealthy · 关闭路由 · admission 503"
+    API->>CP: "apply: retry / scale_down"
     rect rgb(255, 244, 214)
-    Note over SCH,DEV: ★1~★5 恢复事务（GPU: 全部跳过, batch 原地保留）
-    CP->>SCH: retry / scale_down（v7 现有命令; scale_down 先由 DPC kill 目标 DP）
-    SCH->>DEV: ★1 stop_device + restart_device（连续, 各幸存 rank 同拍）
-    SCH->>SCH: ★2 reinit_process_group（集体=天然 barrier）
-    Note over SCH: ★3 此后 MLP sync 走独立容错 gloo PG（C1 已重建）
-    SCH->>SCH: ★4 retract running_batch → waiting queue（保留 output_ids）
-    Note over SCH: ★5 图有效性检查, 必要时重捕
-    SCH-->>CP: FaultToleranceCommandReqOutput（命令 ACK, 仅 DP leader）
+    Note over SCH,DEV: "★1~★5 恢复事务（GPU: 全部跳过, batch 原地保留）"
+    CP->>SCH: "retry / scale_down — v7 现有命令; scale_down 先由 DPC kill 目标 DP"
+    SCH->>DEV: "★1 stop_device + restart_device（连续, 各幸存 rank 同拍）"
+    SCH->>SCH: "★2 reinit_process_group（集体=天然 barrier）"
+    Note over SCH: "★3 此后 MLP sync 走独立容错 gloo PG（C1 已重建）"
+    SCH->>SCH: "★4 retract running_batch → waiting queue（保留 output_ids）"
+    Note over SCH: "★5 图有效性检查, 必要时重捕"
+    SCH-->>CP: "FaultToleranceCommandReqOutput（命令 ACK, 仅 DP leader）"
     end
-    CP->>CP: publish DPC route（等 Node 0 DPC ACK）
-    SCH->>SCH: 清 _engine_paused=False
-    CP-->>API: admission 开放, 恢复服务
-    SCH->>SCH: next batch: 被 retract 请求重 prefill 续推
-    Note over CP,API: 并行路径 — ★6 rejoin replacement 进程 device init 前 stop+restart，<br/>★7 故障 DP 请求: 未出 token → 重推, 已出 token → 503
+    CP->>CP: "publish DPC route（等 Node 0 DPC ACK）"
+    SCH->>SCH: "清 _engine_paused=False"
+    CP-->>API: "admission 开放, 恢复服务"
+    SCH->>SCH: "next batch: 被 retract 请求重 prefill 续推"
+    Note over CP,API: "并行路径: ★6 rejoin replacement 进程 device init 前 stop+restart；★7 故障 DP 请求: 未出 token → 重推, 已出 token → 503"
 ```
 
 ### 6.4 标记与适配点映射
