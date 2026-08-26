@@ -43,24 +43,24 @@ global_rank ∈ [0, W)
 
 它用于进程存活、节点 heartbeat、DPC shutdown 和发送内部命令。whole-DP 操作必须把一个 DP id 展开到它的全部 global ranks。
 
-GPU 当前实现显式维护这种展开。NPU 分支的 compact communication object 却用 `dp_rank/dp_size` 初始化，而收到的 active mask 来自 scale-down 内部路径。当前缺少 `R > 1` 的明确转换。
+GPU 和 NPU Manager 都已生成这种 whole-DP global-rank mask。NPU 核对提交的 compact communication object 仍用 `dp_rank/dp_size` 初始化，这是 `R > 1` 路径中的局部坐标错误；目标应直接改用 `tp_rank/tp_size`，无需把 mask 压回 DP 空间。
 
 ### 2.3 Compact survivor group rank
 
-设存活 original DP 有序集合：
+设存活 original global scheduler rank 有序集合：
 
 ```text
-S = (s0, s1, ..., sK-1)
+G = (g0, g1, ..., gK-1)
 ```
 
 则：
 
 ```text
-compact_rank(si) = i
+compact_rank(gi) = i
 effective_world_size = K
 ```
 
-它只在新建的 Gloo MLP-sync group 和 HCCL EPLB group 内使用，不暴露到 HTTP API。
+它只在新建的 Gloo MLP-sync group 和 HCCL EPLB group 内使用，不暴露到 HTTP API。一个 DP 有多个 scheduler rank 时，其所有 survivor sibling 都分别占一个 compact group rank；HTTP 仍只暴露 original DP id。
 
 ### 2.4 Effective EP rank
 
@@ -72,6 +72,8 @@ effective_world_size = K
 保持概念分离有助于未来出现“每 DP 多 EP/scheduler rank”时扩展映射。
 
 ## 3. 示例：4 路缩到 3 路
+
+本例假设每个 DP 只有一个 scheduler rank，用于展示基础映射；`attn_tp>1` 见 3.1。
 
 初始：
 
@@ -99,6 +101,24 @@ effective_to_original:   [0,  2, 3, -1]
 | 3 | 2 | 是 |
 
 外部 status 仍显示 engine 2、engine 3，而不是 engine 1、engine 2。
+
+### 3.1 DP2 × ATTN_TP2
+
+设 `D=2`、`attn_cp=1`、`attn_tp=2`，物理 global rank 布局为：
+
+```text
+DP0: global ranks [0, 1]
+DP1: global ranks [2, 3]
+```
+
+移除 DP1 后，Manager 已生成：
+
+```text
+active_global_rank_mask = [1, 1, 0, 0]
+active_original_ranks   = [0, 1]
+```
+
+DP0 的两个 attention-TP sibling 都执行 rebuild，并分别以 `tp_rank=0/1` 加入 compact group rank 0/1。MLP-sync gather 的两个结果写入 `global_info_tensor.view(-1, info_width)` 的 global slots 0/1，对应 `[DP0, ATTN_TP0]` 和 `[DP0, ATTN_TP1]`。这正是当前提交需要补齐的两处坐标修改；group、membership generation、EPLB 和 MC2 elastic-info 不需要换方案。
 
 ## 4. `elastic_info` 精确布局
 
@@ -268,17 +288,19 @@ NPU 分支在硬件 utils 和 EPLB P2P 路径中增加 format-aware staged copy�
 - static shrink，不声明在线 rejoin；
 - current code path 面向 pause 策略。
 
-### 11.2 隐含但未 gate 的约束
+### 11.2 `attn_tp>1` 的当前实现差距
 
-当前 `NpuFTCommunication` 使用 `original_rank=dp_rank`、`original_world_size=dp_size`，`rebuild()` 则按传入 active mask 枚举 rank。若 mask 长度为 `tp_size` 且 `tp_size != dp_size`，compact rank 和 group world 的语义不再成立。
+规范 rank 空间已经确定为 global scheduler rank。当前 `NpuFTCommunication` 仍使用 `original_rank=dp_rank`、`original_world_size=dp_size`，而 `rebuild()` 枚举 global active mask；NPU MLP-sync 又把 gather 结果写到固定 TP0 槽位。这两处使核对提交只在 `attn_tp=1` 时自然成立。
 
-因此在代码修复前应选择下列之一：
+目标修正是：
 
-- 明确限制 `tp_size == dp_size`，且 attention-CP 不增加每 DP scheduler rank；
-- 或让 Manager 传 DP-level active mask，并在 scheduler 内只对本 DP 的代表 rank创建相应 group；
-- 或完整定义 global-rank 到 DP/EP rank 的投影，支持一个 DP 多 scheduler rank。
+```text
+dp_rank/dp_size -> tp_rank/tp_size
+global_info_tensor[active_ranks, 0]
+  -> global_info_tensor.view(-1, info_width)[active_ranks]
+```
 
-当前文档采用第一项作为保守运行边界，但将其标记为待用户/实现确认，而不是声称 support gate 已经执行。
+预计产品代码少于 10 行，不需要增加新 process-group 类型，也不需要改变 whole-DP mask。修正后仍需单元测试证明 global slot 顺序，并在 NPU 上验证 DP2×ATTN_TP2 的 shrink、MLP-sync、EPLB、精度和持续请求。`attn_cp>1` 保持独立待验证项。
 
 ## 12. 失败模式
 

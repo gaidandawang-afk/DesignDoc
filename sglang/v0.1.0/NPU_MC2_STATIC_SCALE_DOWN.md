@@ -74,7 +74,14 @@ Scheduler 调用 `init_npu_ft_communication()` 保存：
 - collective timeout；
 - 当前 active original ranks。
 
-当前代码传入的是 `dp_rank/dp_size`，而 scale-down 的 `active_mask` 来自 scheduler global-rank 空间。若一个 DP 包含多个 scheduler rank，两者可能不等长。因此在新增明确映射或启动 gate 前，本版本把“每个 DP 一个 scheduler rank”视为隐含限制。
+scale-down 的 `active_mask` 已经是 scheduler global-rank 空间，且一个 survivor DP 的所有 attention-TP sibling 都会执行同一命令。核对提交仍把通信对象初始化为 `dp_rank/dp_size`，这是局部实现坐标残留，不是 compact-group 设计限制。目标实现应改为：
+
+```text
+original_rank       = tp_rank
+original_world_size = tp_size
+```
+
+同时，MLP-sync gather 结果应按 global rank 写入 `global_info_tensor` 的展平槽位，而不是固定写入每个 DP 的 TP0 槽位。这两处预计只涉及 3–6 行产品代码；完成后现有 group rebuild、EPLB context 和 MC2 elastic-info 都继续使用同一个 global-rank mask。
 
 ## 4. scale-down 设备事务
 
@@ -249,15 +256,20 @@ compact group generation、device restart、MC2 mapping 和重新加入 original
 
 目前只有 elastic-info tensor 地址稳定的测试意图，没有 NPU 硬件 Graph capture/replay artifact，不能写成“无需重捕图已验证”。
 
-### 10.6 多 scheduler-rank DP
+### 10.6 `attn_tp>1`
 
-当前代码把 `dp_rank/dp_size` 与 global active mask 直接组合，缺少 whole-DP 展开/压缩适配。除非用户确认目标拓扑并补充代码 gate，本版本仅把每 DP 单 scheduler-rank 视为当前可解释配置。
+v0.1.0 设计支持一个 DP 包含多个 attention-TP scheduler rank。Manager 已将 DP mask 扩展为连续 whole-DP global-rank mask，DPC 会关闭 removed DP 的所有 sibling，survivor DP 的全部 sibling 则执行同一 scale-down。当前提交只差两处局部坐标修正：
+
+1. `init_npu_ft_communication()` 使用 `tp_rank/tp_size`；
+2. NPU MLP-sync gather 写入展平的 `[dp, attn_cp, attn_tp]` global-rank 槽位。
+
+预计改动少于 10 行，不需要改写 compact-group 或 MC2 elastic-info 设计。代码未合入且没有 NPU 硬件结果前，不能把它写成“当前提交已验证支持”。`attn_cp>1` 虽可复用同一 global-rank 投影，但仍应单独验证，不在本结论中自动放开。
 
 ## 11. 集成到当前控制面的工作清单
 
 1. 把 NPU 数据面改动移植到 `codex/ft-vllm-api-refactor` 的 Manager/controller 基线，而不是反向恢复旧同步 API。
 2. 让 scale-down 统一接收 whole-DP `removed_dp_ranks`，由控制面生成 NPU 所需 survivor mask。
-3. 明确 NPU 通信对象使用 DP mask 还是 global-rank mask，并在启动时验证尺寸和 rank 空间。
+3. 将 NPU 通信对象统一到 global-rank mask，完成 `tp_rank/tp_size` 和展平 gather 槽位的小改动。
 4. 接入异步 202、唯一 request id、status 聚合错误和 operation guard。
 5. 统一 inactive route 503 与外部 LB 更新契约。
 6. 保留 NPU scale-down 专属 stop/restart、compact group 和 elastic-info 事务。
@@ -269,7 +281,7 @@ compact group generation、device restart、MC2 mapping 和重新加入 original
 只有同时满足以下条件，才能把能力矩阵从“代码已实现”升级为“集成并验证”：
 
 - NPU 分支对齐当前 API 和三态模型；
-- 配置 gate 与实际 rank 空间一致；
+- `attn_tp>1` global-rank 修正已合入，并有映射单测；
 - 非 rank0 incident + 静态 scale-down 在 NPU 硬件成功；
 - survivor 推理、显式路由、精度、EPLB rebalance 和持续请求通过；
 - inactive target 的 HTTP/status 语义与 GPU 契约一致；

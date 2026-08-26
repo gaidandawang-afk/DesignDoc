@@ -296,17 +296,16 @@ ModuleNotFoundError: No module named 'sglang'
 
 ## 10. 待决代码问题
 
-### 10.1 NPU active mask rank 空间
+### 10.1 NPU `attn_tp>1` global-rank 小改动
 
-证据：通信对象按 `dp_rank/dp_size` 初始化，`rebuild()` 直接枚举传入 active mask。当前没有证明一个 DP 含多个 scheduler rank 时语义正确，也没有 fail-fast gate。
+结论：`active_mask` 的规范空间应保持为 global scheduler rank，不需要压缩成 DP-level mask。Manager 已按 whole DP 展开 mask，所有 survivor attention-TP sibling 都会收到并执行同一命令，MC2/EPLB 也使用 global EP/rank 空间。
 
-需要决策：
+核对提交仍有两处局部问题：
 
-- 正式限制每 DP 一个 scheduler rank；或
-- 改为明确的 DP-level mask；或
-- 实现 global-rank→DP-rank 投影。
+- `init_npu_ft_communication()` 使用 `dp_rank/dp_size`，应改为 `tp_rank/tp_size`；
+- NPU MLP-sync gather 写到 `[active_original_ranks, 0]`，应写到 `global_info_tensor` 展平后的 global-rank 槽位。
 
-在决策前，文档按最窄支持域声明。
+预计产品代码改动为 3–6 行、少于 10 行。该结论把问题从“规格限制”修正为“设计支持但当前提交缺少小适配”。完成标准是：补 DP2×ATTN_TP2 单元测试，并在 NPU 上验证 whole-DP shrink、MLP-sync、EPLB、精度和持续请求；`attn_cp>1` 另行验证。
 
 ### 10.2 `scale_down` instruction-specific 参数校验
 

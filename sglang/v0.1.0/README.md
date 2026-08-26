@@ -107,12 +107,12 @@ Git 历史保留原文及其演进；本目录不复制一份可能继续漂移�
 - 不能把 fail-stop、健康请求成功或拓扑变化误报为 FT 指令成功；
 - GPU 已验证结论不能自动外推到 NPU；NPU 代码存在也不能替代硬件 E2E。
 
-NPU 当前实现对一个 DP 内含多个 scheduler rank 的支持边界尚未闭合：通信组初始化使用 `dp_rank/dp_size`，缩容 mask 则来自 global scheduler-rank 空间。v0.1.0 暂将“每个 DP 一个 scheduler rank”列为代码隐含约束，直到实现增加明确 gate 或完成多 rank DP 验证。
+NPU compact-group 设计本身不要求“每个 DP 一个 scheduler rank”，v0.1.0 目标规格允许 `attn_tp>1`。核对提交 `127f5a6711` 仍有两处坐标残留：通信对象用 `dp_rank/dp_size` 初始化，MLP-sync gather 写入固定 TP0 槽位。把前者改为 `tp_rank/tp_size`，并把后者写入展平后的 global-rank 槽位即可沿用现有 whole-DP mask、survivor group 和 MC2/EPLB 映射；预计产品代码少于 10 行。该小改动尚未进入核对提交，也没有 NPU `attn_tp>1` E2E，因此应表述为“设计支持、实现待补齐并验证”，而不是架构限制。
 
 ## 7. 下一阶段工作
 
 1. 将 NPU MC2 适配 rebase/port 到当前 GPU FT/API 分支，解决 Manager、status schema、异步 `request_id` 和 503 admission 语义差异。
-2. 为 NPU 配置增加与真实拓扑假设一致的 fail-fast gate，或实现 whole-DP global-rank mask 到 compact DP group 的完整映射。
+2. 完成 NPU `attn_tp>1` 的 global-rank 小改动，并补充 DP2×ATTN_TP2 的映射单测和硬件 E2E。
 3. 在 NPU 硬件上执行冷启动、注入非 rank0 故障、静态缩容、精度、持续请求、Graph 和失败超时用例，保存 artifact。
 4. 在真实多节点 GPU 环境补一次物理节点下电/网络隔离，区分逻辑租约 E2E 与真实主机故障证据。
 5. 只在上述集成和设备验证完成后，升级 NPU 能力矩阵；不得提前把目标设计写成已支持能力。

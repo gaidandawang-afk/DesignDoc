@@ -398,7 +398,7 @@ routed_dp_rank=<N> is not active
 - 不与运行时 EP scale、PD disaggregation、Ray 多节点编排等未集成模式组合；
 - whole-DP 拓扑可整除并能从 global rank 精确映射回 DP。
 
-NPU 分支将 `device=npu`、`elastic_ep_backend=mc2` 加入旧 support gate，但尚未合并当前 GPU 分支的完整 gate。尤其一个 DP 多 scheduler-rank 的映射目前应视为未支持，直到明确的配置 gate 或 E2E 证明出现。
+NPU 分支将 `device=npu`、`elastic_ep_backend=mc2` 加入旧 support gate，但尚未合并当前 GPU 分支的完整 gate。v0.1.0 目标规格允许 `attn_tp>1`：whole-DP mask 已按 global scheduler rank 展开，survivor compact group 也可以直接使用该空间。核对提交仍需把通信对象从 `dp_rank/dp_size` 改为 `tp_rank/tp_size`，并把 MLP-sync 结果写入展平的 global-rank 槽位；预计少于 10 行产品代码。完成该改动和 NPU E2E 前，能力等级仍是“设计支持、当前提交未验证”。
 
 ## 12. 规范性约束摘要
 

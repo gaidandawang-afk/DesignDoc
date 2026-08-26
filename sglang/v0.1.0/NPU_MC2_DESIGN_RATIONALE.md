@@ -205,8 +205,8 @@ v0.1.0 使用更明确的语义：受故障影响请求失败/丢弃，survivor 
 
 集成前必须明确：
 
-1. NPU `active_mask` 的规范 rank 空间是 DP 还是 global scheduler rank；
-2. 当前版本是否正式限制每 DP 一个 scheduler rank；
+1. NPU `active_mask` 统一使用 global scheduler-rank 空间，并完成 `tp_rank/tp_size` 与展平 MLP-sync 槽位修正；
+2. 为 `attn_tp>1` 增加 DP2×ATTN_TP2 映射单测和 NPU 硬件 E2E；
 3. NPU stop/restart 失败时进程级 fail-stop 和外部重启责任如何划分；
 4. compact survivor group 是否允许多次连续 shrink，以及 generation/store 生命周期如何清理；
 5. NPU Graph 的产品契约是保持旧图、按 topology 重捕，还是禁用 Graph；
