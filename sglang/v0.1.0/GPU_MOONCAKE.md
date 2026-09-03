@@ -1,6 +1,6 @@
 # GPU + Mooncake DP-only Fault Tolerance 实现说明
 
-> SGLang：`codex/ft-vllm-api-refactor` @ `8a8860da82cf1ef4191c865f97715d2779c61743`
+> SGLang：`codex/ft-vllm-api-refactor` @ `90380d6e6ce7bdefc3d209f4fe284623d40720fb`
 >
 > Mooncake：`codex/mooncake-nohca-ft` @ `d727290c86e4c821a6fc4c22848ae5c0f269f4f5`
 >
@@ -144,7 +144,7 @@ routed_dp_rank=<N> is not active
 
 ## 7. 自动 rejoin
 
-continue 下发生普通 4→3→4 时，expected 始终为 true；process 和 native 状态重新可用后，`_update_route_after_observation()` 直接恢复 route。
+continue 下发生普通 4→3→4 时，expected 始终为 true。`_update_route_after_observation()` 仅在 process alive、native active 且 pending recovery 已清空后恢复 route；任一观察尚未收敛时，status 保持 `dead`，route 保持关闭。
 
 被控制面 scale-down、expected 已经为 false 的 DP 重新出现后，Manager 不立即放流。它分别观察：
 
@@ -153,7 +153,7 @@ continue 下发生普通 4→3→4 时，expected 始终为 true；process 和 n
 3. `pending_recovery_global_ranks` 已清空；
 4. 当前没有 FT 操作执行中。
 
-全部满足后，`_auto_recover_ready_dps()` 将 expected 重新置 true，`_update_route_after_observation()` 发布新 route。该自动路径用于恢复已提交移除的 DP，没有外部 `recover` 指令。
+全部满足后，`_restore_ready_dps_to_expected_topology()` 将 expected 重新置 true，`_update_route_after_observation()` 发布新 route。该自动路径用于恢复已提交移除的 DP，没有外部 `recover` 指令。
 
 rejoin 验证不能只检查 status 变绿，还应覆盖：
 

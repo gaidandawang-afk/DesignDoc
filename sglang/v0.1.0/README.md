@@ -23,7 +23,7 @@ v0.1.0 是一个跨分支的文档版本：
 
 | 组件 | 分支 | 本次核对提交 | 用途 |
 |---|---|---:|---|
-| SGLang GPU FT/API | `codex/ft-vllm-api-refactor` | `8a8860da82cf1ef4191c865f97715d2779c61743` | 当前三态模型、异步 API、路由拦截、自动 rejoin |
+| SGLang GPU FT/API | `codex/ft-vllm-api-refactor` | `90380d6e6ce7bdefc3d209f4fe284623d40720fb` | 当前三态模型、异步 API、观察驱动路由与自动 rejoin |
 | Mooncake GPU FT | `codex/mooncake-nohca-ft` | `d727290c86e4c821a6fc4c22848ae5c0f269f4f5` | no-HCA 恢复、CUDA Graph 延迟建连修复 |
 | SGLang NPU MC2 FT | `codex/review-0814-npu-ft-minimal` | `127f5a6711f7133597d7ae496577427e0758d037` | NPU 静态 scale-down、存活组重建、MC2 elastic info |
 | server_tool 契约 | `codex/test/ft-vllm-api-refactor` | `7367ae315f524477abca46c51c9b082658d58fa1` | GPU 场景、断言和 artifact 索引 |

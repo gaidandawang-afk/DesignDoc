@@ -23,7 +23,7 @@
 ```text
 SGLang workspace: D:\Codex\repos\sglang
 branch:           codex/ft-vllm-api-refactor
-reviewed HEAD:    8a8860da82cf1ef4191c865f97715d2779c61743
+reviewed HEAD:    90380d6e6ce7bdefc3d209f4fe284623d40720fb
 
 Mooncake workspace: D:\Codex\repos\mooncake-nohca-ft
 branch:             codex/mooncake-nohca-ft
@@ -323,11 +323,11 @@ GPU 当前 `validate_apply_payload()` 只检查 body、instruction、`params` �
 
 当前 request id 只要求是字符串，省略时默认为 `""`。这符合当前代码，但会削弱跨操作相关性。建议在后续契约中要求调用方提供非空唯一值，或由服务端在空值时生成 UUID；在代码改变前，测试不能误写成“缺 request id 返回 400”。
 
-### 10.4 status `healthy` 与 native-ready
+### 10.4 continue 的 route/status rejoin gate
 
-当前 `_rank_state()` 只检查 expected、process-alive 和 `unhealthy_dp_ranks`，不直接检查 `native_active_dp_mask`；admission、continue route 和自动 rejoin 才检查 native 状态。因此极端观察窗口中，status 可能显示 `healthy`，但请求仍因 route/pause/operation guard 不可进入。
+SGLang `90380d6e6c` 将 continue 的 route 和 status 统一建立在 observed-ready mask 上：DP 的全部进程存活、runtime active，且 `pending_recovery_global_ranks` 中不存在该 DP 的成员。进程重新注册但尚未收到新的 runtime-ready 上报时，status 保持 `dead`，route 保持关闭。
 
-需要决策：status 的 `healthy` 是否只描述控制面 engine 状态，还是应严格等价于 serving-ready。若要求后者，应调整 classifier 和用例；在代码改变前，客户端不能仅凭 `status == healthy` 判定 endpoint 可路由。
+本地隔离测试覆盖 runtime-only、process-first、runtime-first、expected 不变以及已 scale-down DP 的 rejoin，共 26/26 通过。该变更尚未在 GPU E2E 上按精确 HEAD 重跑，因此证据等级为 D2，不替代现有 D3 场景证据。
 
 ### 10.5 全量精确 HEAD 重跑
 

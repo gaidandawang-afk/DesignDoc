@@ -96,13 +96,13 @@ Scheduler 负责本地请求与模型执行状态，并通过内部控制消息�
 
 | 状态 | 含义 | 可接收新请求 |
 |---|---|---|
-| `healthy` | 当前 classifier 中：仍 expected、进程完整且不在 `unhealthy_dp_ranks` | 取决于 route/native/pause |
+| `healthy` | 仍 expected、进程完整且不在 `unhealthy_dp_ranks`；continue 还要求 runtime ready 且无 pending recovery | 取决于 pause/operation guard |
 | `unhealthy` | 仍 expected，且 pause 策略记录到未处理 scheduler incident | 否 |
-| `dead` | 已不在 expected 集合，或 DP 的进程不完整 | 否 |
+| `dead` | 已不在 expected、进程不完整，或 continue 的 runtime 尚未 ready/pending recovery 未清空 | 否 |
 
 `disabled` 是旧文档状态，v0.1.0 不再使用。被静态缩容的 DP 显示为 `dead`。
 
-必须注意：当前 status classifier 不直接读取 `native_active_dp_mask`，而 admission、continue route 和自动 rejoin 会读取它。因此 status 中的 `healthy` 不是“此刻一定可路由”的同义词；操作确认仍需同时检查 route 行为和目标 topology。若后续产品要求 status 精确表达 native-not-ready，需要单独调整 classifier，不能只改文档。
+continue 的 status 和 route 使用同一份 observed-ready 事实：process alive、runtime active 且无 pending recovery。这样进程重新注册但 Mooncake 尚未完成 rejoin 时，status 保持 `dead`，route 也保持关闭。pause 仍由 `unhealthy_dp_ranks`、`cluster_paused` 和 operation guard 表达控制面事务状态。
 
 ### 4.2 内部状态
 
@@ -341,7 +341,7 @@ NPU 当前分支没有复刻 Mooncake 的固定通信组实现，而是：
 
 ## 8. 路由恢复和自动 rejoin
 
-continue 的普通 4→3→4 不改变 expected topology。runtime/process 观察重新满足 serving-ready 条件后，Manager 直接恢复 route，不经过 `_auto_recover_ready_dps()`。
+continue 的普通 4→3→4 不改变 expected topology。runtime/process 观察重新满足 serving-ready 条件后，Manager 直接恢复 route；expected-topology 恢复步骤因 expected 已为 true 而不产生变化。
 
 只有已经由控制面 scale-down、`expected_dp_mask == false` 的 DP 才需要自动 rejoin。其开放条件是：
 
@@ -352,7 +352,7 @@ native backend active
 no pending recovery rank
 ```
 
-实现完成内部恢复后，Manager 将 expected 重新置为 true 并重新发布路由，不要求外部调用 `recover`。
+`_restore_ready_dps_to_expected_topology()` 在上述条件满足后将 expected 重新置为 true，随后 `_update_route_after_observation()` 重新发布路由，不要求外部调用 `recover`。
 
 必须区分：
 
