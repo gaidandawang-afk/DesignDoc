@@ -52,6 +52,8 @@ serving_ready[d]
 
 任何一项为 false，该 DP 都不能接收新请求。当前 `continue` 路径按这个公式更新 `_route_dp_mask`；`pause` incident 期间 `_route_dp_mask` 可能暂时保留旧值，但 `cluster_paused` 或 `ft_operation_in_progress` 会全局拒绝 admission。因而 `_route_dp_mask` 本身不是唯一服务事实，不能脱离 pause/operation guard 单独解释。
 
+continue 下的 Mooncake membership loss 不提交控制面缩容，`expected_dp_mask` 保持 true。runtime-active 或 process-alive 变为 false 已足以关闭 route；两者恢复后 route 自动恢复。因此 expected 表示控制面期望拓扑，不表示当前 serving 集合。
+
 ## 3. 控制面组件和唯一事实源
 
 ### 3.1 Manager
@@ -132,10 +134,12 @@ cluster_paused
 
 ```text
 healthy
-  ├─ Python/collective incident ───────────────> unhealthy
-  │                                               ├─ retry 成功 ──> healthy
-  │                                               ├─ scale_down ─> dead
-  │                                               └─ 操作失败 ───> unhealthy / fail-stop
+  ├─ pause 下的 Python/collective incident ─────> unhealthy
+  │                                                ├─ retry 成功 ──> healthy
+  │                                                ├─ scale_down ─> dead
+  │                                                └─ 操作失败 ───> unhealthy / fail-stop
+  ├─ continue 下的 Mooncake membership loss ────> expected 不变
+  │                                                └─ runtime/process 观察更新 route/status
   └─ process/lease lost ───────────────────────> dead
                                                     └─ process + native 恢复
                                                        且无 pending ─> healthy
@@ -258,14 +262,14 @@ NPU 分支当前仍包含这些旧接口，属于待移植差异，不是本规�
 
 ## 6. 故障类型与处置
 
-### 6.1 Python/设备异常，进程仍存活
+### 6.1 Mooncake membership loss
 
-异常 DP 进入 `unhealthy`，Manager 根据启动策略选择全局 pause 或 continue：
+pause 和 continue 在推理层的处理方式不同：
 
-- `pause`：停止所有 DP 接收/推进新请求，等待显式 `retry` 或 `scale_down`；
-- `continue`：隔离异常 DP，存活 DP 继续服务；受故障影响的请求以失败/丢弃语义结束。
+- `pause`：`forward_raw` 后检测到 active-rank 减少时主动抛出异常，Scheduler 进入 pause，Manager 记录 `unhealthy`，等待显式 `retry` 或 `scale_down`；
+- `continue`：该路径不抛异常。Mooncake Elastic EP 自动完成 active-rank 4→3，EPLB 随后收敛，ModelRunner 再次执行 `forward_raw`。Manager 不创建或下发 FT 事务，只根据 runtime/process 上报更新 route 和 status，`expected_dp_mask` 保持不变。
 
-GPU 当前实现支持两种策略。NPU v0.1.0 只声明 pause 后执行静态 scale-down 的代码路径。
+NPU v0.1.0 只声明 pause 后执行静态 scale-down 的代码路径。
 
 ### 6.2 进程退出或节点 lease 失效
 
@@ -275,7 +279,7 @@ watchdog 观察到的是逻辑节点 heartbeat lease，而不是电源状态本�
 
 ### 6.3 `retry`（GPU）
 
-`retry` 仅适用于仍 expected 的 unhealthy DP，且所有 expected 进程必须存活。典型步骤：
+`retry` 仅适用于 pause 下仍 expected 的 unhealthy DP，且所有 expected 进程必须存活。continue 的 Mooncake 自动收缩和 forward 重试不经过该控制面事务。典型步骤：
 
 1. operation guard 获取事务；
 2. 验证存在 incident，且 expected 进程完整；
@@ -335,18 +339,20 @@ NPU 当前分支没有复刻 Mooncake 的固定通信组实现，而是：
 
 该方案只重建新引入的专用通信组，不会替换整个 SGLang 全局 `_TP` group。详见 [NPU_MC2_STATIC_SCALE_DOWN.md](NPU_MC2_STATIC_SCALE_DOWN.md) 和 [NPU_MC2_COMPACTED_TOPOLOGY.md](NPU_MC2_COMPACTED_TOPOLOGY.md)。
 
-## 8. 自动 rejoin
+## 8. 路由恢复和自动 rejoin
 
-GPU rejoin 的开放条件是同一 DP 同时满足：
+continue 的普通 4→3→4 不改变 expected topology。runtime/process 观察重新满足 serving-ready 条件后，Manager 直接恢复 route，不经过 `_auto_recover_ready_dps()`。
+
+只有已经由控制面 scale-down、`expected_dp_mask == false` 的 DP 才需要自动 rejoin。其开放条件是：
 
 ```text
-expected == false or pending recovery
+expected == false
 process alive for all global ranks
 native backend active
 no pending recovery rank
 ```
 
-实现完成内部恢复后，Manager 将 expected 重新置为 true 并重新发布路由。pause 策略下也采用自动 rejoin，不要求外部调用 `recover`。
+实现完成内部恢复后，Manager 将 expected 重新置为 true 并重新发布路由，不要求外部调用 `recover`。
 
 必须区分：
 

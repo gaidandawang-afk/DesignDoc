@@ -78,12 +78,14 @@ D:\Codex\tools\server_tool\skills\test-service\cases\sglang\INDEX.md
 | 12 | continue whole-node rejoin | lease、进程、native、route、推理 | 50/50 |
 | 13 | pause scale-down rejoin | dead→自动恢复，无 recover API | 62/62 |
 | 14 | CUDA Graph rejoin | capture、shrink、恢复、精度、replay | 78/78 |
-| 15 | exception continue discard/resume | 受影响请求丢弃，survivor 恢复 | 23/23 |
+| 15 | 历史 continue exception-injection 兜底 | 通用 Scheduler 异常包装路径 | 23/23 |
 | 16 | unattended pause timeout | 无控制输入时保持隔离并有界结束 | 22/22 |
 
 ### 3.1 证据组合限制
 
 场景 1–13、15–16 在 SGLang `7375c482ba` 上完成，共 15/16 场景、517/517 断言。
+
+场景 15 使用一次性 ModelRunner exception injector，验证的是通用 Scheduler 异常兜底，不是 Mooncake membership loss 的 continue 主链路，不能据此把 discard/resume 写成 Elastic EP continue 的外部语义。后者应验证 `forward_raw` 不抛异常、Mooncake active-rank 自动 4→3、EPLB 收敛和同一请求重新推理。
 
 CUDA Graph/status 增量场景在：
 
@@ -137,7 +139,7 @@ HTTP 层 error body 是 OpenAI 风格 `error.message`；不同调用包装器可
 
 ### 4.3 incident 状态
 
-进程被 kill 时，目标 DP 可以直接成为 `dead`，survivor 仍全部 `healthy`。用例不得强制要求一定观察到短暂 `unhealthy`，因为轮询可能跨过该瞬态。
+进程被 kill 时，目标 DP 直接成为 `dead`，survivor 仍全部 `healthy`。continue 不经过 `unhealthy`；pause 的 `unhealthy` 用于进程仍存活、等待控制面处置的 incident。
 
 ### 4.4 rejoin
 

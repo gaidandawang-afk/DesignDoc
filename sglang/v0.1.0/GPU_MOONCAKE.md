@@ -47,15 +47,19 @@ Mooncake 分支扩展弹性 EP 连接与恢复，重点不是重建 Python 进�
 - `1ca33d50`：在 `connect_on_init=false` 时，Graph 捕获前为 replacement Buffer 安装本地 IPC handle 和 local-only active mask；
 - `d727290c`：dispatch/combine Graph 捕获期间根据 active ranks 跳过 inactive peer，避免捕获到尚未建立的连接。
 
-## 3. incident 和路由隔离
+## 3. Mooncake 自动收缩与控制面观察
 
-### 3.1 scheduler exception
+### 3.1 continue
 
-任一 global scheduler rank 上报异常后，Manager 将故障扩展到它所属的整个 DP。该 DP 不再进入 route mask。
+continue 的故障处理与 Mooncake Elastic EP 保持一致。`forward_raw` 返回后发现 active-rank 从 4 减少到 3 时不抛异常；Mooncake 更新 active ranks，EPLB 完成收敛，ModelRunner 再次执行 `forward_raw`。
 
-`pause` 策略下，集群 admission 返回 `fault_tolerance_paused`，直到控制操作完成；`continue` 策略下，其他健康 DP 保持可路由，故障 DP 上受影响请求按 discard/abort 语义结束。
+这条路径没有控制面 FT 请求，也不产生 `unhealthy` incident。`expected_dp_mask` 保持 true；Manager 只消费 runtime/process 上报，并用 observed availability 更新 status 和 route。
 
-### 3.2 进程与逻辑节点故障
+### 3.2 pause
+
+pause 下，`forward_raw` 后检测到 membership loss 会主动抛异常。Manager 记录 `unhealthy`，集群 admission 返回 `fault_tolerance_paused`，直到显式 `retry` 或 `scale_down` 完成。
+
+### 3.3 进程与逻辑节点故障
 
 watchdog 维护 `node_id -> (last_seen, advertised_global_ranks)` 的 lease。当前参数为：
 
@@ -76,7 +80,7 @@ FT watchdog lease expired: nodes=[3] global_ranks=[3]
 
 ## 4. `retry` 事务
 
-`retry` 用于进程仍存活、DP 仍 expected 的异常。前置条件：
+`retry` 用于 pause 下进程仍存活、DP 仍 expected 的异常；continue 的自动 forward 重试不经过该事务。前置条件：
 
 - `unhealthy_dp_ranks` 非空；
 - 每个 expected DP 的全部 global ranks 都存活；
@@ -140,14 +144,16 @@ routed_dp_rank=<N> is not active
 
 ## 7. 自动 rejoin
 
-被 scale-down 或进程退出的 DP 重新出现后，Manager 不立即放流。它分别观察：
+continue 下发生普通 4→3→4 时，expected 始终为 true；process 和 native 状态重新可用后，`_update_route_after_observation()` 直接恢复 route。
+
+被控制面 scale-down、expected 已经为 false 的 DP 重新出现后，Manager 不立即放流。它分别观察：
 
 1. 该 DP 全部 global process alive；
 2. Mooncake native active；
 3. `pending_recovery_global_ranks` 已清空；
 4. 当前没有 FT 操作执行中。
 
-全部满足后，`_auto_recover_ready_dps()` 将 expected 重新置 true，`_route_after_observation()` 发布新 route。pause 和 continue 策略都使用这条自动路径，没有外部 `recover` 指令。
+全部满足后，`_auto_recover_ready_dps()` 将 expected 重新置 true，`_update_route_after_observation()` 发布新 route。该自动路径用于恢复已提交移除的 DP，没有外部 `recover` 指令。
 
 rejoin 验证不能只检查 status 变绿，还应覆盖：
 
@@ -215,11 +221,11 @@ server_tool 的 16 个场景覆盖：
 |---|---|
 | 基线 | FT 关闭、原生请求、status-only |
 | retry | 单异常 retry、先缩容后 survivor 异常 retry |
-| scale-down | pause/continue、异常触发、double/continuous shrink |
+| scale-down | pause、异常触发、double/continuous shrink |
 | topology | whole DP shutdown、A×C>1、4→3→2→1 |
 | API | envelope、busy、前置条件、inactive route 503 |
 | rejoin | continue、pause、CUDA Graph |
-| 请求语义 | in-flight kill、discard/resume、unattended timeout |
+| 请求语义 | in-flight kill、Mooncake forward 重试、unattended pause timeout |
 
 精确断言数、提交配对和 artifact 见 [VALIDATION.md](VALIDATION.md)。
 

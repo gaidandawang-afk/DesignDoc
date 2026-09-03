@@ -34,9 +34,9 @@ v0.1.0 是一个跨分支的文档版本：
 
 ### 3.1 GPU + Mooncake
 
-GPU 路线已经形成可验证闭环：故障检测、中心化 pause/continue、`retry`、`scale_down`、外部请求路由拦截、存活 DP 恢复、自动 rejoin，以及 CUDA Graph 下 Mooncake 延迟建连恢复均已有对应代码和测试证据。
+GPU 路线已经形成可验证闭环：pause 下的 `retry`、`scale_down`，continue 下由 Mooncake Elastic EP 完成的 active-rank 收缩、EPLB 和 forward 重试，外部请求路由拦截、存活 DP 恢复，以及 CUDA Graph 下 Mooncake 延迟建连恢复均已有对应代码和测试证据。
 
-当前公开状态只有 `healthy`、`unhealthy`、`dead`。不存在 `disabled` 状态，也不存在显式 `recover` 指令。进程重新出现且 Mooncake native active mask 恢复后，由 Manager 自动重新开放该 DP。
+当前公开状态只有 `healthy`、`unhealthy`、`dead`。不存在 `disabled` 状态，也不存在显式 `recover` 指令。continue 不提交新的 expected topology；Manager 根据 runtime/process 观察结果关闭或恢复 route。只有已被控制面 scale-down 的 DP 才需要在进程和 Mooncake native active mask 恢复后重新加入 expected topology。
 
 FT 写接口是异步接受模型：合法请求返回 HTTP 202 和 `request_id`，最终结果通过 `/fault_tolerance/status` 中同一 `last_ft_request_id` 及目标拓扑共同确认。仅观察拓扑变化不能证明本次请求成功。
 
@@ -64,10 +64,10 @@ NPU 分支不再只是设计稿。它已经实现静态 scale-down 的关键数�
 | 静态 `scale_down` | 已实现并验证 | 已实现代码 | NPU 缺硬件 E2E 和新 API 集成 |
 | scale-down 后路由拦截 | HTTP 503 已验证 | 旧分支为旧语义 | 目标契约应统一为 GPU 当前语义 |
 | 自动 rejoin | 已实现并验证 | 未实现/未验证 | 无显式 `recover` |
-| `continue` 丢弃受影响请求后恢复 | 已实现并验证 | 未声明支持 | 不应由“代码未显式禁止”推断支持 |
+| `continue` 自动收缩并重试 forward | 已实现并验证 | 未声明支持 | Mooncake Elastic EP 完成 4→3、EPLB 和重新推理，控制面不下发 FT 指令 |
 | 整节点 watchdog | 逻辑节点租约已验证 | 未验证 | GPU E2E 使用同一物理机上的逻辑节点，不等价于真实下电 |
 | Graph 恢复 | CUDA Graph 已验证 | 仅固定 tensor 地址单测意图 | NPU 无硬件 graph 证据 |
-| 请求 retract/replay | 未采用；使用 fail/discard 语义 | 未实现 | 旧 NPU 方案中的设想已删除 |
+| 控制面请求 retract/replay | 未采用 | 未实现 | continue 的 forward 重试属于 Mooncake/推理层行为，不是控制面请求回放 |
 
 ## 4. 文档导航
 
