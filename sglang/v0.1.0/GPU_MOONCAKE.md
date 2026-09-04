@@ -64,9 +64,15 @@ pause 下，`forward_raw` 后检测到 membership loss 会主动抛异常。Mana
 watchdog 维护 `node_id -> (last_seen, advertised_global_ranks)` 的 lease。当前参数为：
 
 ```text
-sweep interval = 1 second
-lease timeout  = 5 seconds
+heartbeat interval         = 3 seconds
+lease sweep interval       = 1 second
+lease timeout              = 60 seconds
+process-exit send timeout  = 60 seconds
+FT control phase timeout   = 300 seconds by default
+unattended pause timeout   = 300 seconds by default
 ```
+
+`fault_tolerance_timeout` 分别约束 shutdown、Scheduler command ACK 和 route ACK；每个阶段独立计时，不是整个 FT 操作共享一个总计时器。`fault_tolerance_pause_timeout` 是无人提交控制请求时的独立 fail-stop deadline，Scheduler 收到 `retry` 或 `scale_down` 后即清除。测试用例的轮询截止时间属于验收预算，不参与产品控制链路。
 
 lease 超时后，该节点广告的全部 global ranks 被标为 down，再按 whole-DP 映射关闭相关路由。代码入口为 `FaultToleranceManager.observe_watchdog_heartbeat()`。
 
