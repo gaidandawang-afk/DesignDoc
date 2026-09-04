@@ -74,6 +74,8 @@ unattended pause timeout   = 300 seconds by default
 
 `fault_tolerance_timeout` 分别约束 shutdown、Scheduler command ACK 和 route ACK；每个阶段独立计时，不是整个 FT 操作共享一个总计时器。`fault_tolerance_pause_timeout` 是无人提交控制请求时的独立 fail-stop deadline，Scheduler 收到 `retry` 或 `scale_down` 后即清除。测试用例的轮询截止时间属于验收预算，不参与产品控制链路。
 
+每个节点 DPC 的现有 watchdog 线程同时持有该节点的 FT shutdown 接收 socket，并在每次 3 秒轮询中非阻塞处理 shutdown 后发送 heartbeat。shutdown 因而最多增加一个 watchdog 轮询周期的下发延迟，不进入 DPC 的推理请求 `event_loop`，也不改变非 FT 请求路径。
+
 lease 超时后，该节点广告的全部 global ranks 被标为 down，再按 whole-DP 映射关闭相关路由。代码入口为 `FaultToleranceManager.observe_watchdog_heartbeat()`。
 
 现有 E2E 日志已经观察到：
